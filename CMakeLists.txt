@@ -7,16 +7,14 @@ project(ub_bench C)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_SKIP_RPATH TRUE)
 
-# 交叉编译工具�?if(CROSS_COMPILE)
+if(CROSS_COMPILE)
     set(CMAKE_C_COMPILER "${CROSS_COMPILE}")
     message(STATUS "CMAKE_C_COMPILER: ${CROSS_COMPILE}")
 endif()
 
-# 安全加固编译选项（与 UMDK src/urma/CMakeLists.txt 保持一致）
 set(UB_BENCH_C_FLAGS " -Wall -Werror -Wformat -Wfloat-equal -Wtrampolines -g -O2 \
 -fno-strict-aliasing -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE -fPIC")
 
-# 架构相关编译选项
 set(UB_BENCH_FLAGS_ARM64 " -march=armv8-a+crc -DUB_ARCH_ARM64")
 set(UB_BENCH_FLAGS_x86_64 " -msse4.2 -DUB_ARCH_X86_64")
 if("${X86_CROSS_COMPILATION}" STREQUAL "enable")
@@ -30,18 +28,15 @@ else()
     set(CMAKE_C_FLAGS "${UB_BENCH_C_FLAGS} ${UB_BENCH_FLAGS_x86_64}")
 endif()
 
-# 安全加固链接选项
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rdynamic -pie \
 -Wl,-z,noexecstack,-z,relro,-z,now")
 
-# 可�? ASAN (AddressSanitizer / LeakSanitizer / UndefinedBehaviorSanitizer)
 if("${ASAN}" STREQUAL "enable")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address -fsanitize-recover=address \
 -fsanitize=leak -fsanitize=undefined -fno-omit-frame-pointer")
     message(STATUS "ASAN enabled")
 endif()
 
-# 可�? PERF_CYCLE 性能周期计数
 if("${PERF_CYCLE}" STREQUAL "enable")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DPERF_CYCLE_FLAG")
     message(STATUS "PERF_CYCLE enabled")
@@ -49,7 +44,6 @@ endif()
 
 message(STATUS "CMAKE_C_FLAGS = ${CMAKE_C_FLAGS}")
 
-# 查找系统已安装的 liburma �?liburma_common
 find_library(URMA_LIB NAMES urma)
 if(NOT URMA_LIB)
     message(FATAL_ERROR

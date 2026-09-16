@@ -3651,7 +3651,10 @@ static int run_bw_once(perftest_context_t *ctx, perftest_config_t *cfg)
 
 int run_read_bw(perftest_context_t *ctx, perftest_config_t *cfg)
 {
-    print_bw_header(cfg);
+    if (cfg->threads > 1 || (cfg->mode == PERFTEST_MODE_PIPELINE && cfg->bw_only == false)) {
+    } else {
+        print_bw_header(cfg);
+    }
 
     /* WRITE BW test run in both sides */
     if (cfg->all == true) {
@@ -3677,7 +3680,11 @@ int run_write_bw(perftest_context_t *ctx, perftest_config_t *cfg)
         return run_send_bw(ctx, cfg);
     }
     /* WRITE BW test run in both sides */
-    print_bw_header(cfg);
+    if (cfg->threads > 1 || (cfg->mode == PERFTEST_MODE_PIPELINE && cfg->bw_only == false)) {
+        /* ub_bench multi-thread / pipeline+latency prints its own report header */
+    } else {
+        print_bw_header(cfg);
+    }
     if (cfg->all == true) {
         for (uint32_t i = 1; i <= cfg->order; i++) {
             cfg->size = (1U << i);
@@ -3864,7 +3871,10 @@ err_destroy_jfs_wr:
 
 int run_send_bw(perftest_context_t *ctx, perftest_config_t *cfg)
 {
-    print_bw_header(cfg);
+    if (cfg->threads > 1 || (cfg->mode == PERFTEST_MODE_PIPELINE && cfg->bw_only == false)) {
+    } else {
+        print_bw_header(cfg);
+    }
 
     if (cfg->all == true) {
         for (uint32_t i = 1; i <= cfg->order; i++) {
@@ -3887,7 +3897,10 @@ int run_send_bw(perftest_context_t *ctx, perftest_config_t *cfg)
 
 int run_atomic_bw(perftest_context_t *ctx, perftest_config_t *cfg)
 {
-    print_bw_header(cfg);
+    if (cfg->threads > 1 || (cfg->mode == PERFTEST_MODE_PIPELINE && cfg->bw_only == false)) {
+    } else {
+        print_bw_header(cfg);
+    }
 
     int ret = run_bw_once(ctx, cfg);
     if (ret != 0) {
