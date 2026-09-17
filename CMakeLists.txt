@@ -58,6 +58,16 @@ if(NOT URMA_COMMON_LIB)
 endif()
 message(STATUS "Found urma_common: ${URMA_COMMON_LIB}")
 
+find_path(URMA_INCLUDE_DIR urma_api.h
+    PATHS /usr/include/ub/umdk/urma
+    NO_DEFAULT_PATH
+)
+if(NOT URMA_INCLUDE_DIR)
+    message(FATAL_ERROR
+        "urma headers not found. Please install UMDK first.")
+endif()
+message(STATUS "Found urma headers: ${URMA_INCLUDE_DIR}")
+
 add_executable(ub_bench
     src/ub_bench.c
     src/ub_bench_hist.c
@@ -73,7 +83,7 @@ add_executable(ub_bench
 
 target_include_directories(ub_bench
     PRIVATE
-        ${CMAKE_SOURCE_DIR}/include/urma
+        ${URMA_INCLUDE_DIR}
         ${CMAKE_SOURCE_DIR}/include/ub
         ${CMAKE_SOURCE_DIR}/src
 )
