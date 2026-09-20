@@ -1776,6 +1776,12 @@ int check_local_cfg(perftest_config_t *cfg)
         exit(1);
     }
 
+    /* --threads only for BW tests */
+    if (cfg->threads > 1 && cfg->type != PERFTEST_BW) {
+        LOG_ERROR("--threads is only for BW tests.\n");
+        exit(1);
+    }
+
     /* --qps only for BW sequential mode */
     if (cfg->qps > 0 && cfg->type != PERFTEST_BW) {
         LOG_ERROR("--qps is only for BW tests.\n");
