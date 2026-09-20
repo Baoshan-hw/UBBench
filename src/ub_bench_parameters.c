@@ -1176,7 +1176,8 @@ int perftest_parse_args(int argc, char *argv[], perftest_config_t *cfg)
             case PERFTEST_OPT_THREADS:
                 (void)ub_str_to_u32(optarg, &cfg->threads);
                 if (cfg->threads == 0) {
-                    cfg->threads = 1;
+                    LOG_ERROR("--threads must be >= 1.\n");
+                    exit(1);
                 }
                 break;
             case PERFTEST_OPT_QPS:
