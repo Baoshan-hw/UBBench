@@ -845,12 +845,9 @@ int perftest_parse_args(int argc, char *argv[], perftest_config_t *cfg)
                     LOG_ERROR("Invalid parameter(jettys).\n");
                     return -1;
                 }
-                if (cfg->type != PERFTEST_BW && cfg->jettys > 1 && cfg->threads <= 1) {
-                    LOG_ERROR("Multiple jettys only available on BW tests or with --threads.\n");
+                if (cfg->type != PERFTEST_BW && cfg->jettys > 1) {
+                    LOG_ERROR("Multiple jettys only available on BW tests.\n");
                     return -1;
-                }
-                if (cfg->type != PERFTEST_BW && cfg->jettys > 1 && cfg->threads > 1) {
-                    LOG_INFO("Multiple jettys in LAT mode, running multi-thread ping-pong.\n");
                 }
                 break;
             case 'K':
