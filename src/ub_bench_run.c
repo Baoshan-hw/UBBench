@@ -555,7 +555,6 @@ int bench_run_sequential(perftest_context_t *ctx, perftest_config_t *cfg)
                               (char *)&remote) != 0) {
                     return -1;
                 }
-                print_bi_bw_report(&local, &remote, cfg);
             }
         }
         return 0;
