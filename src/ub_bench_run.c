@@ -149,6 +149,23 @@ static void *sequential_worker(void *arg)
 }
 
 typedef struct {
+    uint32_t size;
+    uint64_t total_count;
+    uint64_t global_start;
+    uint64_t global_end;
+    uint64_t target_qps;
+    bool bw_only;
+    double t_min;
+    double t_median;
+    double t_avg;
+    double p99;
+    double p999;
+    double p9999;
+    double p99999;
+    double pmax;
+} sequential_report_data_t;
+
+typedef struct {
     uint64_t actual_total_qps;
     uint64_t target_total_qps;
     uint64_t per_thread_qps;
@@ -219,6 +236,49 @@ static void print_sequential_report(perftest_config_t *cfg, uint64_t total_count
         LOG_QUIET(" actual_QPS  target_QPS  BW_avg[%s/s]  MsgRate[Mpps]\n", unit_str);
         LOG_QUIET(" %-11lu %-11lu %-13.2f %-13.6f\n",
                   (uint64_t)actual_qps, target_qps, bw_avg, msg_rate);
+    }
+}
+
+static void print_sequential_report_from_data(const sequential_report_data_t *data,
+                                             const perftest_config_t *cfg)
+{
+    double cpu_mhz = get_cpu_mhz(false);
+    if (cpu_mhz <= 0.0) {
+        LOG_ERROR("Failed to get cpu mhz for report.\n");
+        return;
+    }
+
+    double cycles_to_units = cpu_mhz * PERFTEST_M;
+    double unit_ratio = (double)PERFTEST_BW_MB;
+    const char *unit_str = "MiB";
+    if (cfg->bw_unit == PERFTEST_KB) {
+        unit_ratio = (double)PERFTEST_BW_KB;
+        unit_str = "KiB";
+    } else if (cfg->bw_unit == PERFTEST_GB) {
+        unit_ratio = (double)PERFTEST_BW_GB;
+        unit_str = "GiB";
+    }
+
+    uint64_t cycles_sum = data->global_end - data->global_start;
+    double bw_avg = ((double)data->size * data->total_count * cycles_to_units) /
+                    ((double)cycles_sum * unit_ratio);
+    double actual_qps = (double)data->total_count * cycles_to_units / (double)cycles_sum;
+    double msg_rate = actual_qps / (double)PERFTEST_M;
+
+    LOG_QUIET("\n");
+    LOG_QUIET("---- ub_bench Report ----\n");
+    if (data->bw_only == false) {
+        LOG_QUIET(" actual_QPS  target_QPS  BW_avg[%s/s]  MsgRate[Mpps]  "
+                  "t_min[us]  t_median[us]  t_avg[us]  P99[us]  P99.9[us]  P99.99[us]  P99.999[us]  Pmax[us]\n",
+                  unit_str);
+        LOG_QUIET(" %-11lu %-11lu %-14.2f %-14.6f %-10.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f %-7.2f\n",
+                  (uint64_t)actual_qps, data->target_qps, bw_avg, msg_rate,
+                  data->t_min, data->t_median, data->t_avg,
+                  data->p99, data->p999, data->p9999, data->p99999, data->pmax);
+    } else {
+        LOG_QUIET(" actual_QPS  target_QPS  BW_avg[%s/s]  MsgRate[Mpps]\n", unit_str);
+        LOG_QUIET(" %-11lu %-11lu %-13.2f %-13.6f\n",
+                  (uint64_t)actual_qps, data->target_qps, bw_avg, msg_rate);
     }
 }
 
@@ -331,12 +391,30 @@ static int run_sequential_client(perftest_context_t *ctx, perftest_config_t *cfg
         sync_time(cfg, i, g_seq_sync_after[cfg->api_type]);
     }
 
-    bw_report_data_t local = {0};
-    bw_report_data_t remote = {0};
-    local.size = cfg->size;
-    local.iters = total_count;
-    for (i = 0; i < cfg->pair_num; i++) {
-        sync_data(cfg, i, sizeof(bw_report_data_t), (char *)&local, (char *)&remote);
+    {
+        sequential_report_data_t sdata = {0};
+        sdata.size = cfg->size;
+        sdata.total_count = total_count;
+        sdata.global_start = global_start;
+        sdata.global_end = global_end;
+        sdata.target_qps = (cfg->qps > 0) ? (uint64_t)cfg->threads * cfg->qps : 0;
+        sdata.bw_only = cfg->bw_only;
+        if (cfg->bw_only == false && total_count > 0) {
+            sdata.t_min = (global_hist.min_delta < (uint64_t)-1) ?
+                          (double)global_hist.min_delta / cpu_mhz : 0.0;
+            sdata.t_median = (double)hist_percentile(&global_hist, 0.5) / cpu_mhz;
+            sdata.t_avg = hist_avg(&global_hist) / cpu_mhz;
+            sdata.p99 = (double)hist_percentile(&global_hist, 0.99) / cpu_mhz;
+            sdata.p999 = (double)hist_percentile(&global_hist, 0.999) / cpu_mhz;
+            sdata.p9999 = (double)hist_percentile(&global_hist, 0.9999) / cpu_mhz;
+            sdata.p99999 = (double)hist_percentile(&global_hist, 0.99999) / cpu_mhz;
+            sdata.pmax = (double)global_hist.max_delta / cpu_mhz;
+        }
+        sequential_report_data_t remote_data = {0};
+        for (i = 0; i < cfg->pair_num; i++) {
+            sync_data(cfg, i, sizeof(sequential_report_data_t),
+                      (char *)&sdata, (char *)&remote_data);
+        }
     }
 
     free(args);
@@ -474,11 +552,27 @@ static int run_sweep_client(perftest_context_t *ctx, perftest_config_t *cfg)
 
         for (i = 0; i < cfg->pair_num; i++) {
             sync_time(cfg, i, g_seq_sync_after[cfg->api_type]);
-            bw_report_data_t local = {0};
-            bw_report_data_t remote = {0};
-            local.size = cfg->size;
-            local.iters = total_count;
-            sync_data(cfg, i, sizeof(bw_report_data_t), (char *)&local, (char *)&remote);
+            sequential_report_data_t sdata = {0};
+            sdata.size = cfg->size;
+            sdata.total_count = total_count;
+            sdata.global_start = global_start;
+            sdata.global_end = global_end;
+            sdata.target_qps = (uint64_t)cfg->threads * target_qps;
+            sdata.bw_only = cfg->bw_only;
+            if (cfg->bw_only == false && total_count > 0) {
+                sdata.t_min = (merged.min_delta < (uint64_t)-1) ?
+                              (double)merged.min_delta / cpu_mhz : 0.0;
+                sdata.t_median = (double)hist_percentile(&merged, 0.5) / cpu_mhz;
+                sdata.t_avg = hist_avg(&merged) / cpu_mhz;
+                sdata.p99 = (double)hist_percentile(&merged, 0.99) / cpu_mhz;
+                sdata.p999 = (double)hist_percentile(&merged, 0.999) / cpu_mhz;
+                sdata.p9999 = (double)hist_percentile(&merged, 0.9999) / cpu_mhz;
+                sdata.p99999 = (double)hist_percentile(&merged, 0.99999) / cpu_mhz;
+                sdata.pmax = (double)merged.max_delta / cpu_mhz;
+            }
+            sequential_report_data_t remote_data = {0};
+            sync_data(cfg, i, sizeof(sequential_report_data_t),
+                      (char *)&sdata, (char *)&remote_data);
         }
 
         free(args);
@@ -533,28 +627,50 @@ int bench_run_sequential(perftest_context_t *ctx, perftest_config_t *cfg)
             }
         }
 
+        if (cfg->cmd == PERFTEST_SEND_BW) {
+            for (i = 0; i < cfg->pair_num; i++) {
+                if (sync_time(cfg, i, g_seq_sync_before[cfg->api_type]) != 0) {
+                    return -1;
+                }
+                if (run_once_bw_recv(ctx, cfg) != 0) {
+                    LOG_ERROR("Failed to run recv in send_bw server.\n");
+                    return -1;
+                }
+                if (sync_time(cfg, i, g_seq_sync_after[cfg->api_type]) != 0) {
+                    return -1;
+                }
+                sequential_report_data_t local = {0};
+                sequential_report_data_t remote = {0};
+                if (sync_data(cfg, i, sizeof(sequential_report_data_t),
+                              (char *)&local, (char *)&remote) != 0) {
+                    return -1;
+                }
+                if (ctx->run_ctx.tposted[0] > 0 && ctx->run_ctx.tcompleted[0] > 0) {
+                    remote.global_start = ctx->run_ctx.tposted[0];
+                    remote.global_end = ctx->run_ctx.tcompleted[0];
+                }
+                remote.bw_only = true;
+                print_sequential_report_from_data(&remote, cfg);
+            }
+            return 0;
+        }
+
         uint32_t loop_count = cfg->sweep ? cfg->sweep_steps : 1;
         for (uint32_t s = 0; s < loop_count; s++) {
             for (i = 0; i < cfg->pair_num; i++) {
                 if (sync_time(cfg, i, g_seq_sync_before[cfg->api_type]) != 0) {
                     return -1;
                 }
-                if (cfg->cmd == PERFTEST_SEND_BW) {
-                    if (run_once_bw_recv(ctx, cfg) != 0) {
-                        LOG_ERROR("Failed to run recv in send_bw server.\n");
-                        return -1;
-                    }
-                }
                 if (sync_time(cfg, i, g_seq_sync_after[cfg->api_type]) != 0) {
                     return -1;
                 }
-                bw_report_data_t local = {0};
-                bw_report_data_t remote = {0};
-                local.size = cfg->size;
-                if (sync_data(cfg, i, sizeof(bw_report_data_t), (char *)&local,
-                              (char *)&remote) != 0) {
+                sequential_report_data_t local = {0};
+                sequential_report_data_t remote = {0};
+                if (sync_data(cfg, i, sizeof(sequential_report_data_t),
+                              (char *)&local, (char *)&remote) != 0) {
                     return -1;
                 }
+                print_sequential_report_from_data(&remote, cfg);
             }
         }
         return 0;
