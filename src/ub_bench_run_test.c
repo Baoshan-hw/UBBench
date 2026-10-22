@@ -2332,7 +2332,7 @@ cleaning:
     return ret;
 }
 
-int run_once_bw_recv(perftest_context_t *ctx, perftest_config_t *cfg)
+int run_once_bw_recv(perftest_context_t *ctx, perftest_config_t *cfg, uint64_t *out_rcnt)
 {
     run_test_ctx_t *run_ctx = &ctx->run_ctx;
     uint64_t rcnt = 0;
@@ -2524,6 +2524,9 @@ int run_once_bw_recv(perftest_context_t *ctx, perftest_config_t *cfg)
     }
     if (cfg->time_type.bs.iterations == 1) {
         run_ctx->tcompleted[0] = get_cycles();
+    }
+    if (out_rcnt != NULL) {
+        *out_rcnt = rcnt;
     }
     ret = 0;
 cleaning:
@@ -3754,7 +3757,7 @@ static int run_send_bw_once(perftest_context_t *ctx, perftest_config_t *cfg)
         if (cfg->enable_random_size != 0) {
             exchange_sum_len(ctx, cfg);
         }
-        ret = run_once_bw_recv(ctx, cfg);
+        ret = run_once_bw_recv(ctx, cfg, NULL);
         if (ret != 0) {
             LOG_ERROR("Failed to run once recv bw, size: %u.\n", cfg->size);
             return -1;

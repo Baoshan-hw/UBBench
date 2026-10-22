@@ -481,7 +481,7 @@ void print_cfg(const perftest_config_t *cfg)
                   cfg->mode == PERFTEST_MODE_SEQUENTIAL ? "sequential" : "pipeline");
         LOG_QUIET(" Threads             : %u\n", cfg->threads);
         if (cfg->qps > 0) {
-            LOG_QUIET(" Per-thread QPS       : %lu\n", cfg->qps);
+            LOG_QUIET(" Per-thread QPS      : %lu\n", cfg->qps);
         }
         if (cfg->sweep) {
             LOG_QUIET(" Sweep               : %lu:%lu:%lu (start:end:step)\n",
@@ -1736,10 +1736,12 @@ int check_local_cfg(perftest_config_t *cfg)
         cfg->jettys = cfg->threads;
     }
 
-    /* send_bw server: recv is single-threaded (run_once_bw_recv uses jfc_r[0]),
-       force threads=1 so JFCs are shared. jettys stays at client's value. */
-    if (cfg->server_ip == NULL && cfg->cmd == PERFTEST_SEND_BW && cfg->threads > 1) {
-        LOG_INFO("send_bw server: --threads reset to 1 (single-threaded recv), jettys=%u.\n",
+    /* send_bw server: pipeline/credit/jfce modes use run_once_bw_recv (shared jfc_r[0]),
+       force threads=1 so JFCs are shared. Sequential mode (without credit/jfce) supports
+       multi-threaded recv via per-jetty JFC + recv_server_worker. jettys stays at client's value. */
+    if (cfg->server_ip == NULL && cfg->cmd == PERFTEST_SEND_BW && cfg->threads > 1 &&
+        (cfg->mode == PERFTEST_MODE_PIPELINE || cfg->enable_credit || cfg->use_jfce)) {
+        LOG_INFO("send_bw server: --threads reset to 1 (pipeline/credit/event requires shared CQ), jettys=%u.\n",
                   cfg->jettys);
         cfg->threads = 1;
     }
@@ -1832,6 +1834,7 @@ int check_local_cfg(perftest_config_t *cfg)
     if (cfg->type == PERFTEST_BW && cfg->mode == PERFTEST_MODE_SEQUENTIAL) {
         cfg->jfs_depth = 1;
         cfg->cq_mod = 1;
+        cfg->jfr_post_list = 1;
         if (cfg->bw_only == false && cfg->time_type.bs.duration != 1) {
             cfg->no_peak = false;
         }
@@ -1842,11 +1845,6 @@ int check_local_cfg(perftest_config_t *cfg)
         cfg->cq_mod = 1;
         if (cfg->time_type.bs.duration != 1) {
             cfg->no_peak = false;
-        }
-        if (cfg->jfs_depth > PERFTEST_DEF_JFS_DEPTH_BW) {
-            LOG_ERROR("jfs_depth > %u not supported with latency collection (ring buffer limit).\n",
-                      PERFTEST_DEF_JFS_DEPTH_BW);
-            exit(1);
         }
         /* run_once_bw_mt creates one worker per thread, each handling one jetty.
            Auto-set threads = jettys so all jettys are covered. */

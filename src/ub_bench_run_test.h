@@ -30,7 +30,7 @@ void update_duration_state(perftest_context_t *ctx, perftest_config_t *cfg);
 void print_bi_bw_report(const bw_report_data_t *local_bw_report,
                         const bw_report_data_t *remote_bw_report, const perftest_config_t *cfg);
 void print_bw_header(const perftest_config_t *cfg);
-int run_once_bw_recv(perftest_context_t *ctx, perftest_config_t *cfg);
+int run_once_bw_recv(perftest_context_t *ctx, perftest_config_t *cfg, uint64_t *out_rcnt);
 int prepare_jfr_wr(perftest_context_t *ctx, perftest_config_t *cfg);
 uint64_t get_remote_seg_va(const perftest_context_t *ctx, const perftest_config_t *cfg, uint32_t i);
 

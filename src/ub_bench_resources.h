@@ -162,13 +162,6 @@ typedef struct perftest_thread_arg {
 } perftest_thread_arg_t;
 
 typedef struct {
-    uint64_t tposted_ring[128]; // ring buffer, size = max jfs_depth
-    uint32_t ring_head;
-    uint32_t ring_tail;
-    uint32_t ring_count;
-} tposted_ring_t;
-
-typedef struct {
     perftest_config_t *cfg;
     perftest_context_t *ctx;
     uint32_t thread_id;
@@ -178,7 +171,6 @@ typedef struct {
     uint64_t start_time;
     uint64_t end_time;
     latency_hist_t hist;
-    tposted_ring_t ring;
     uint64_t time_limit_cycles; // sweep: 0 = no limit
     uint64_t total_count;       // per-thread packet count (independent of histogram)
     double cpu_mhz;            // CPU frequency, computed once by main thread

@@ -148,6 +148,94 @@ static void *sequential_worker(void *arg)
     return NULL;
 }
 
+static void *recv_server_worker(void *arg)
+{
+    bench_thread_arg_t *t = (bench_thread_arg_t *)arg;
+    perftest_context_t *ctx = t->ctx;
+    perftest_config_t *cfg = t->cfg;
+    run_test_ctx_t *run_ctx = &ctx->run_ctx;
+    uint32_t id = t->jetty_start;
+
+    urma_cr_t *cr = calloc(1, sizeof(urma_cr_t) * PERFTEST_POLL_BATCH);
+    if (cr == NULL) {
+        t->end_time = get_cycles();
+        return (void *)(intptr_t)(-1);
+    }
+
+    urma_status_t status;
+    uint64_t rcnt = 0;
+    uint64_t collected = 0;
+    urma_jfr_wr_t *wr = &run_ctx->jfr_wr[id * cfg->jfr_post_list];
+
+    t->start_time = get_cycles();
+
+    while (1) {
+        if (cfg->time_type.bs.duration == 1) {
+            if (run_ctx->state == END_STATE) {
+                break;
+            }
+        }
+
+        int cqe_cnt = urma_poll_jfc(ctx->jfc_r[id], PERFTEST_POLL_BATCH, cr);
+        if (cqe_cnt < 0) {
+            LOG_ERROR("Failed to poll jfc_r, thread %u.\n", id);
+            free(cr);
+            t->end_time = get_cycles();
+            return (void *)(intptr_t)(-1);
+        }
+
+        for (int i = 0; i < cqe_cnt; i++) {
+            if (cr[i].status != URMA_CR_SUCCESS) {
+                LOG_ERROR("Bad CR status, thread %u, status %d.\n", id, (int)cr[i].status);
+                free(cr);
+                t->end_time = get_cycles();
+                return (void *)(intptr_t)(-1);
+            }
+            rcnt++;
+
+            if (cfg->time_type.bs.duration == 1) {
+                if (run_ctx->state == START_STATE) {
+                    collected++;
+                }
+            } else {
+                collected++;
+            }
+
+            urma_jfr_wr_t *bad_wr = NULL;
+            if (cfg->jetty_mode == PERFTEST_JETTY_SIMPLEX) {
+                status = urma_post_jfr_wr(ctx->jfr[id], wr, &bad_wr);
+            } else {
+                status = urma_post_jetty_recv_wr(ctx->jetty[id], wr, &bad_wr);
+            }
+            if (status != URMA_SUCCESS) {
+                LOG_ERROR("Failed to post recv WR, thread %u, rcnt %lu.\n", id, rcnt);
+                free(cr);
+                t->end_time = get_cycles();
+                return (void *)(intptr_t)(-1);
+            }
+
+            if (cfg->size <= (ctx->page_size / PERFTEST_BUF_NUM)) {
+                uint32_t local_sge_idx = id * PERFTEST_SGE_NUM_PRE_WR * cfg->sge_num + cfg->sge_num;
+                urma_sge_t *local_sge = &run_ctx->jfr_sge[local_sge_idx];
+                uint64_t lva = (cfg->seg_pre_jetty == false)
+                                   ? (uint64_t)ctx->local_buf[0] + id * ctx->buf_size
+                                   : (uint64_t)ctx->local_buf[id];
+                increase_loc_addr(local_sge, cfg->size, (uint64_t)run_ctx->rposted + rcnt,
+                                  lva, cfg->cache_line_size, ctx->page_size);
+            }
+        }
+
+        if (cfg->time_type.bs.iterations == 1 && rcnt >= cfg->iters) {
+            break;
+        }
+    }
+
+    free(cr);
+    t->end_time = get_cycles();
+    t->total_count = collected;
+    return NULL;
+}
+
 typedef struct {
     uint32_t size;
     uint64_t total_count;
@@ -207,7 +295,6 @@ static void print_sequential_report(perftest_config_t *cfg, uint64_t total_count
     double bw_avg = ((double)cfg->size * total_count * cycles_to_units) /
                     ((double)cycles_sum * unit_ratio);
     double actual_qps = (double)total_count * cycles_to_units / (double)cycles_sum;
-    uint64_t target_qps = (cfg->qps > 0) ? (uint64_t)cfg->threads * cfg->qps : 0;
     double msg_rate = actual_qps / (double)PERFTEST_M;
 
     LOG_QUIET("\n");
@@ -223,19 +310,18 @@ static void print_sequential_report(perftest_config_t *cfg, uint64_t total_count
         uint64_t p99999 = hist_percentile(merged_hist, 0.99999);
         uint64_t pmax = merged_hist->max_delta;
 
-        LOG_QUIET(" actual_QPS  target_QPS  BW_avg[%s/s]  MsgRate[Mpps]  "
-                  "t_min[us]  t_median[us]  t_avg[us]  P99[us]  P99.9[us]  P99.99[us]  P99.999[us]  Pmax[us]\n",
+        LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]  "
+                  "t_min[us]  t_max[us]  t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us]\n",
                   unit_str);
-        LOG_QUIET(" %-11lu %-11lu %-14.2f %-14.6f %-10.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f %-7.2f\n",
-                  (uint64_t)actual_qps, target_qps, bw_avg, msg_rate,
-                  t_min_us, (double)p50 / cpu_mhz, t_avg_us,
+        LOG_QUIET(" %-11u %-11lu %-12lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
+                  cfg->size, total_count, (uint64_t)actual_qps, bw_avg, msg_rate,
+                  t_min_us, (double)pmax / cpu_mhz, (double)p50 / cpu_mhz, t_avg_us,
                   (double)p99 / cpu_mhz, (double)p999 / cpu_mhz,
-                  (double)p9999 / cpu_mhz, (double)p99999 / cpu_mhz,
-                  (double)pmax / cpu_mhz);
+                  (double)p9999 / cpu_mhz, (double)p99999 / cpu_mhz);
     } else {
-        LOG_QUIET(" actual_QPS  target_QPS  BW_avg[%s/s]  MsgRate[Mpps]\n", unit_str);
-        LOG_QUIET(" %-11lu %-11lu %-13.2f %-13.6f\n",
-                  (uint64_t)actual_qps, target_qps, bw_avg, msg_rate);
+        LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]\n", unit_str);
+        LOG_QUIET(" %-11u %-11lu %-12lu %-13.2f %-13.6f\n",
+                  cfg->size, total_count, (uint64_t)actual_qps, bw_avg, msg_rate);
     }
 }
 
@@ -268,17 +354,17 @@ static void print_sequential_report_from_data(const sequential_report_data_t *da
     LOG_QUIET("\n");
     LOG_QUIET("---- ub_bench Report ----\n");
     if (data->bw_only == false) {
-        LOG_QUIET(" actual_QPS  target_QPS  BW_avg[%s/s]  MsgRate[Mpps]  "
-                  "t_min[us]  t_median[us]  t_avg[us]  P99[us]  P99.9[us]  P99.99[us]  P99.999[us]  Pmax[us]\n",
+        LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]  "
+                  "t_min[us]  t_max[us]  t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us]\n",
                   unit_str);
-        LOG_QUIET(" %-11lu %-11lu %-14.2f %-14.6f %-10.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f %-7.2f\n",
-                  (uint64_t)actual_qps, data->target_qps, bw_avg, msg_rate,
-                  data->t_min, data->t_median, data->t_avg,
-                  data->p99, data->p999, data->p9999, data->p99999, data->pmax);
+        LOG_QUIET(" %-11u %-11lu %-12lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
+                  data->size, data->total_count, (uint64_t)actual_qps, bw_avg, msg_rate,
+                  data->t_min, data->pmax, data->t_median, data->t_avg,
+                  data->p99, data->p999, data->p9999, data->p99999);
     } else {
-        LOG_QUIET(" actual_QPS  target_QPS  BW_avg[%s/s]  MsgRate[Mpps]\n", unit_str);
-        LOG_QUIET(" %-11lu %-11lu %-13.2f %-13.6f\n",
-                  (uint64_t)actual_qps, data->target_qps, bw_avg, msg_rate);
+        LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]\n", unit_str);
+        LOG_QUIET(" %-11u %-11lu %-12lu %-13.2f %-13.6f\n",
+                  data->size, data->total_count, (uint64_t)actual_qps, bw_avg, msg_rate);
     }
 }
 
@@ -583,24 +669,123 @@ static int run_sweep_client(perftest_context_t *ctx, perftest_config_t *cfg)
     LOG_QUIET(" threads: %u    size: %u    sweep_duration: %us    mode: sequential\n",
               cfg->threads, cfg->size, cfg->sweep_duration);
     LOG_QUIET("\n");
-    LOG_QUIET(" actual_QPS  target_QPS  per_thr_QPS  BW_avg[%s/s]  MsgRate[Mpps]  "
-              "t_min[us]  t_median[us]  t_avg[us]  P99[us]  P99.9[us]  P99.99[us]  P99.999[us]  Pmax[us]\n",
+    LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]  "
+              "t_min[us]  t_max[us]  t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us]\n",
               unit_str);
     for (uint32_t s = 0; s < cfg->sweep_steps; s++) {
-        LOG_QUIET(" %-11lu %-11lu %-12lu %-14.2f %-14.6f %-10.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f %-7.2f\n",
+        LOG_QUIET(" %-11u %-11lu %-12lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
+                  cfg->size,
+                  results[s].total_count,
                   results[s].actual_total_qps,
-                  results[s].target_total_qps,
-                  results[s].per_thread_qps,
                   results[s].bw_avg, results[s].msg_rate,
-                  results[s].t_min, results[s].t_median, results[s].t_avg,
+                  results[s].t_min, (double)results[s].pmax / cpu_mhz,
+                  results[s].t_median, results[s].t_avg,
                   (double)results[s].p99 / cpu_mhz,
                   (double)results[s].p999 / cpu_mhz,
                   (double)results[s].p9999 / cpu_mhz,
-                  (double)results[s].p99999 / cpu_mhz,
-                  (double)results[s].pmax / cpu_mhz);
+                  (double)results[s].p99999 / cpu_mhz);
     }
 
     free(results);
+    return 0;
+}
+
+static int run_recv_server_mt(perftest_context_t *ctx, perftest_config_t *cfg)
+{
+    uint32_t i;
+
+    for (i = 0; i < cfg->pair_num; i++) {
+        if (sync_time(cfg, i, g_seq_sync_before[cfg->api_type]) != 0) {
+            return -1;
+        }
+    }
+
+    if (cfg->time_type.bs.duration == 1) {
+        update_duration_state(ctx, cfg);
+    }
+
+    bench_thread_arg_t *args = calloc(cfg->threads, sizeof(bench_thread_arg_t));
+    if (args == NULL) {
+        return -1;
+    }
+
+    double cpu_mhz = get_cpu_mhz(false);
+
+    for (i = 0; i < cfg->threads; i++) {
+        args[i].cfg = cfg;
+        args[i].ctx = ctx;
+        args[i].thread_id = i;
+        args[i].jetty_start = i;
+        args[i].jetty_count = 1;
+        args[i].cpu_mhz = cpu_mhz;
+    }
+
+    for (i = 0; i < cfg->threads; i++) {
+        if (pthread_create(&args[i].tid, NULL, recv_server_worker, &args[i]) != 0) {
+            for (uint32_t j = 0; j < i; j++) {
+                pthread_join(args[j].tid, NULL);
+            }
+            free(args);
+            return -1;
+        }
+    }
+
+    void *thread_ret;
+    int worker_err = 0;
+    for (i = 0; i < cfg->threads; i++) {
+        pthread_join(args[i].tid, &thread_ret);
+        if (thread_ret != NULL) {
+            worker_err = -1;
+        }
+    }
+
+    if (worker_err != 0) {
+        free(args);
+        return -1;
+    }
+
+    uint64_t total_count = 0;
+    uint64_t global_start = args[0].start_time;
+    uint64_t global_end = args[0].end_time;
+
+    for (i = 0; i < cfg->threads; i++) {
+        total_count += args[i].total_count;
+        if (args[i].start_time < global_start) {
+            global_start = args[i].start_time;
+        }
+        if (args[i].end_time > global_end) {
+            global_end = args[i].end_time;
+        }
+    }
+
+    if (cfg->time_type.bs.duration == 1) {
+        global_start = ctx->run_ctx.tposted[0];
+        global_end = ctx->run_ctx.tcompleted[0];
+    }
+
+    for (i = 0; i < cfg->pair_num; i++) {
+        if (sync_time(cfg, i, g_seq_sync_after[cfg->api_type]) != 0) {
+            free(args);
+            return -1;
+        }
+    }
+
+    for (i = 0; i < cfg->pair_num; i++) {
+        sequential_report_data_t local = {0};
+        sequential_report_data_t remote = {0};
+        if (sync_data(cfg, i, sizeof(sequential_report_data_t),
+                      (char *)&local, (char *)&remote) != 0) {
+            free(args);
+            return -1;
+        }
+        remote.total_count = total_count;
+        remote.global_start = global_start;
+        remote.global_end = global_end;
+        remote.bw_only = true;
+        print_sequential_report_from_data(&remote, cfg);
+    }
+
+    free(args);
     return 0;
 }
 
@@ -609,7 +794,6 @@ int bench_run_sequential(perftest_context_t *ctx, perftest_config_t *cfg)
     uint32_t i;
 
     if (cfg->server_ip == NULL && !cfg->bidirection) {
-        print_bw_header(cfg);
         uint32_t sweep_count = 0;
         for (i = 0; i < cfg->pair_num; i++) {
             if (sync_data(cfg, i, sizeof(uint32_t), (char *)&sweep_count,
@@ -628,11 +812,15 @@ int bench_run_sequential(perftest_context_t *ctx, perftest_config_t *cfg)
         }
 
         if (cfg->cmd == PERFTEST_SEND_BW) {
+            if (cfg->threads > 1) {
+                return run_recv_server_mt(ctx, cfg);
+            }
             for (i = 0; i < cfg->pair_num; i++) {
                 if (sync_time(cfg, i, g_seq_sync_before[cfg->api_type]) != 0) {
                     return -1;
                 }
-                if (run_once_bw_recv(ctx, cfg) != 0) {
+                uint64_t server_rcnt = 0;
+                if (run_once_bw_recv(ctx, cfg, &server_rcnt) != 0) {
                     LOG_ERROR("Failed to run recv in send_bw server.\n");
                     return -1;
                 }
@@ -649,6 +837,7 @@ int bench_run_sequential(perftest_context_t *ctx, perftest_config_t *cfg)
                     remote.global_start = ctx->run_ctx.tposted[0];
                     remote.global_end = ctx->run_ctx.tcompleted[0];
                 }
+                remote.total_count = server_rcnt;
                 remote.bw_only = true;
                 print_sequential_report_from_data(&remote, cfg);
             }
