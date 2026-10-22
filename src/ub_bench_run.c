@@ -326,7 +326,7 @@ static void print_sequential_report(perftest_config_t *cfg, uint64_t total_count
 }
 
 static void print_sequential_report_from_data(const sequential_report_data_t *data,
-                                             const perftest_config_t *cfg)
+                                             const perftest_config_t *cfg, bool header)
 {
     double cpu_mhz = get_cpu_mhz(false);
     if (cpu_mhz <= 0.0) {
@@ -351,18 +351,24 @@ static void print_sequential_report_from_data(const sequential_report_data_t *da
     double actual_qps = (double)data->total_count * cycles_to_units / (double)cycles_sum;
     double msg_rate = actual_qps / (double)PERFTEST_M;
 
-    LOG_QUIET("\n");
-    LOG_QUIET("---- ub_bench Report ----\n");
+    if (header) {
+        LOG_QUIET("\n");
+        LOG_QUIET("---- ub_bench Report ----\n");
+    }
     if (data->bw_only == false) {
-        LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]  "
-                  "t_min[us]  t_max[us]  t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us]\n",
-                  unit_str);
+        if (header) {
+            LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]  "
+                      "t_min[us]  t_max[us]  t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us]\n",
+                      unit_str);
+        }
         LOG_QUIET(" %-11u %-11lu %-12lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
                   data->size, data->total_count, (uint64_t)actual_qps, bw_avg, msg_rate,
                   data->t_min, data->pmax, data->t_median, data->t_avg,
                   data->p99, data->p999, data->p9999, data->p99999);
     } else {
-        LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]\n", unit_str);
+        if (header) {
+            LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]\n", unit_str);
+        }
         LOG_QUIET(" %-11u %-11lu %-12lu %-13.2f %-13.6f\n",
                   data->size, data->total_count, (uint64_t)actual_qps, bw_avg, msg_rate);
     }
@@ -782,7 +788,7 @@ static int run_recv_server_mt(perftest_context_t *ctx, perftest_config_t *cfg)
         remote.global_start = global_start;
         remote.global_end = global_end;
         remote.bw_only = true;
-        print_sequential_report_from_data(&remote, cfg);
+        print_sequential_report_from_data(&remote, cfg, true);
     }
 
     free(args);
@@ -839,12 +845,24 @@ int bench_run_sequential(perftest_context_t *ctx, perftest_config_t *cfg)
                 }
                 remote.total_count = server_rcnt;
                 remote.bw_only = true;
-                print_sequential_report_from_data(&remote, cfg);
+                print_sequential_report_from_data(&remote, cfg, true);
             }
             return 0;
         }
 
         uint32_t loop_count = cfg->sweep ? cfg->sweep_steps : 1;
+        if (cfg->sweep) {
+            const char *srv_unit_str = (cfg->bw_unit == PERFTEST_KB) ? "KiB" :
+                                       (cfg->bw_unit == PERFTEST_GB) ? "GiB" : "MiB";
+            LOG_QUIET("\n");
+            LOG_QUIET("==== ub_bench Sweep Report ====\n");
+            LOG_QUIET(" threads: %u    size: %u    sweep_duration: %us    mode: sequential\n",
+                      cfg->threads, cfg->size, cfg->sweep_duration);
+            LOG_QUIET("\n");
+            LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]  "
+                      "t_min[us]  t_max[us]  t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us]\n",
+                      srv_unit_str);
+        }
         for (uint32_t s = 0; s < loop_count; s++) {
             for (i = 0; i < cfg->pair_num; i++) {
                 if (sync_time(cfg, i, g_seq_sync_before[cfg->api_type]) != 0) {
@@ -859,7 +877,7 @@ int bench_run_sequential(perftest_context_t *ctx, perftest_config_t *cfg)
                               (char *)&local, (char *)&remote) != 0) {
                     return -1;
                 }
-                print_sequential_report_from_data(&remote, cfg);
+                print_sequential_report_from_data(&remote, cfg, !cfg->sweep);
             }
         }
         return 0;
