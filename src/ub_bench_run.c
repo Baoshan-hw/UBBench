@@ -310,17 +310,17 @@ static void print_sequential_report(perftest_config_t *cfg, uint64_t total_count
         uint64_t p99999 = hist_percentile(merged_hist, 0.99999);
         uint64_t pmax = merged_hist->max_delta;
 
-        LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]  "
-                  "t_min[us]  t_max[us]  t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us]\n",
+        LOG_QUIET(" bytes       iterations  QPS_actual    BW_avg[%s/s]  MsgRate[Mpps]  "
+                  "t_min[us]  t_max[us] t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us] \n",
                   unit_str);
-        LOG_QUIET(" %-11u %-11lu %-12lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
+        LOG_QUIET(" %-11u %-11lu %-13lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
                   cfg->size, total_count, (uint64_t)actual_qps, bw_avg, msg_rate,
                   t_min_us, (double)pmax / cpu_mhz, (double)p50 / cpu_mhz, t_avg_us,
                   (double)p99 / cpu_mhz, (double)p999 / cpu_mhz,
                   (double)p9999 / cpu_mhz, (double)p99999 / cpu_mhz);
     } else {
-        LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]\n", unit_str);
-        LOG_QUIET(" %-11u %-11lu %-12lu %-13.2f %-13.6f\n",
+        LOG_QUIET(" bytes       iterations  QPS_actual    BW_avg[%s/s] MsgRate[Mpps]\n", unit_str);
+        LOG_QUIET(" %-11u %-11lu %-13lu %-13.2f %-13.6f\n",
                   cfg->size, total_count, (uint64_t)actual_qps, bw_avg, msg_rate);
     }
 }
@@ -357,19 +357,19 @@ static void print_sequential_report_from_data(const sequential_report_data_t *da
     }
     if (data->bw_only == false) {
         if (header) {
-            LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]  "
-                      "t_min[us]  t_max[us]  t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us]\n",
+            LOG_QUIET(" bytes       iterations  QPS_actual    BW_avg[%s/s]  MsgRate[Mpps]  "
+                      "t_min[us]  t_max[us] t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us] \n",
                       unit_str);
         }
-        LOG_QUIET(" %-11u %-11lu %-12lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
+        LOG_QUIET(" %-11u %-11lu %-13lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
                   data->size, data->total_count, (uint64_t)actual_qps, bw_avg, msg_rate,
                   data->t_min, data->pmax, data->t_median, data->t_avg,
                   data->p99, data->p999, data->p9999, data->p99999);
     } else {
         if (header) {
-            LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]\n", unit_str);
+            LOG_QUIET(" bytes       iterations  QPS_actual    BW_avg[%s/s] MsgRate[Mpps]\n", unit_str);
         }
-        LOG_QUIET(" %-11u %-11lu %-12lu %-13.2f %-13.6f\n",
+        LOG_QUIET(" %-11u %-11lu %-13lu %-13.2f %-13.6f\n",
                   data->size, data->total_count, (uint64_t)actual_qps, bw_avg, msg_rate);
     }
 }
@@ -671,15 +671,11 @@ static int run_sweep_client(perftest_context_t *ctx, perftest_config_t *cfg)
     }
 
     LOG_QUIET("\n");
-    LOG_QUIET("==== ub_bench Sweep Report ====\n");
-    LOG_QUIET(" threads: %u    size: %u    sweep_duration: %us    mode: sequential\n",
-              cfg->threads, cfg->size, cfg->sweep_duration);
-    LOG_QUIET("\n");
-    LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]  "
-              "t_min[us]  t_max[us]  t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us]\n",
+    LOG_QUIET(" bytes       iterations  QPS_actual    BW_avg[%s/s]  MsgRate[Mpps]  "
+              "t_min[us]  t_max[us] t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us] \n",
               unit_str);
     for (uint32_t s = 0; s < cfg->sweep_steps; s++) {
-        LOG_QUIET(" %-11u %-11lu %-12lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
+        LOG_QUIET(" %-11u %-11lu %-13lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
                   cfg->size,
                   results[s].total_count,
                   results[s].actual_total_qps,
@@ -855,12 +851,8 @@ int bench_run_sequential(perftest_context_t *ctx, perftest_config_t *cfg)
             const char *srv_unit_str = (cfg->bw_unit == PERFTEST_KB) ? "KiB" :
                                        (cfg->bw_unit == PERFTEST_GB) ? "GiB" : "MiB";
             LOG_QUIET("\n");
-            LOG_QUIET("==== ub_bench Sweep Report ====\n");
-            LOG_QUIET(" threads: %u    size: %u    sweep_duration: %us    mode: sequential\n",
-                      cfg->threads, cfg->size, cfg->sweep_duration);
-            LOG_QUIET("\n");
-            LOG_QUIET(" bytes       iterations  QPS          BW_avg[%s/s]  MsgRate[Mpps]  "
-                      "t_min[us]  t_max[us]  t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us]\n",
+            LOG_QUIET(" bytes       iterations  QPS_actual    BW_avg[%s/s]  MsgRate[Mpps]  "
+                      "t_min[us]  t_max[us] t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us] \n",
                       srv_unit_str);
         }
         for (uint32_t s = 0; s < loop_count; s++) {

@@ -481,7 +481,8 @@ void print_cfg(const perftest_config_t *cfg)
                   cfg->mode == PERFTEST_MODE_SEQUENTIAL ? "sequential" : "pipeline");
         LOG_QUIET(" Threads             : %u\n", cfg->threads);
         if (cfg->qps > 0) {
-            LOG_QUIET(" Per-thread QPS      : %lu\n", cfg->qps);
+            LOG_QUIET(" QPS_target          : %lu (threads × qps)\n",
+                      (uint64_t)cfg->threads * cfg->qps);
         }
         if (cfg->sweep) {
             LOG_QUIET(" Sweep               : %lu:%lu:%lu (start:end:step)\n",
