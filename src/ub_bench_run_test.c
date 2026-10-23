@@ -1274,7 +1274,7 @@ int prepare_jfr_wr(perftest_context_t *ctx, perftest_config_t *cfg)
     uint32_t local_sge_idx;
 
     if (cfg->share_jfr == true) {
-        size_per_jetty /= cfg->jettys;
+        size_per_jetty /= cfg->jettys_pre_jfr;
     }
 
     uint32_t rqe_multiple;

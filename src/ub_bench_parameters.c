@@ -137,8 +137,7 @@ static void usage(const char *argv0)
         "  -S, --server <addr>         TCP mode: server ip for bind or connect, default: 127.0.0.1.\n"
         "                              UB mode: server mgmt eid (required for client).\n"
         "  -T, --jfs_depth <dep>       Size of jfs depth (default 128 for BW, 1 for LAT).\n"
-        "  -u, --uboe                  Enable uboe (default false), the parametre sip, dip are required."
-        "                                                                            dscp, vlan, sl are optional\n"
+        "  -u, --uboe                  Enable uboe (default false), sip, dip are required, dscp, vlan, sl are optional.\n"
         "  -V, --version               Show the version.\n"
         "  -w, --warm_up               Choose to use warm_up function, only for read/write/atomic bw test.\n"
         "  -y, --infinite[second]      Run perftest infinitely, only available for BW test.\n"
@@ -149,8 +148,8 @@ static void usage(const char *argv0)
         "  --rate_limit <rate>         Set the maximum rate of sent packages. default unit is [Gbps].\n"
         "  --rate_units <units>        Set the units for rate, MBps (M), Gbps (G)(default) or Kpps (P).\n"
         "  --burst_size <size>         Set the amount of pkts to send in a burst when using rate limiter.\n"
-        "  --order_type <type>         Order type: 0 for default order,"
-        "                   1 for OT (target order), 2 for OI(init order), 3 for OL(layer order), 4 for NO(no order).\n"
+        "  --order_type <type>         Order type: 0 for default order, 1 for OT (target order), 2 for OI(init order),"
+        " 3 for OL(layer order), 4 for NO(no order).\n"
         "  --mgmt_proto <tcp|ub>       Management channel protocol, default: tcp.\n"
         "  --enable_credit             enable send credit, default: disable.\n"
         "  --credit_threshold <num>    Exceed the threshold and do not send, default: jfr_depth * 3 / 4.\n"
@@ -202,7 +201,7 @@ static void usage(const char *argv0)
         "                              Total QPS = threads * qps.\n"
         "  --sweep <start:end:step>    Linear QPS sweep, per-thread. Each step adds <step>.\n"
         "  --sweep-duration <sec>      Seconds per sweep step, default 10.\n"
-        "  --bw-only                    Skip latency collection, pure bandwidth test.\n");
+        "  --bw-only                   Skip latency collection, pure bandwidth test.\n");
 }
 
 static perftest_cmd_type_t parse_command(const char *argv1)
@@ -1745,6 +1744,14 @@ int check_local_cfg(perftest_config_t *cfg)
         LOG_INFO("send_bw server: --threads reset to 1 (pipeline/credit/event requires shared CQ), jettys=%u.\n",
                   cfg->jettys);
         cfg->threads = 1;
+    }
+
+    /* send_bw server + share_jfr + multi-thread: set jettys_pre_jfr=1 so each jetty
+       gets its own jfr and JFC, enabling per-thread recv_server_worker polling. */
+    if (cfg->server_ip == NULL && cfg->cmd == PERFTEST_SEND_BW && cfg->threads > 1 &&
+        cfg->mode == PERFTEST_MODE_SEQUENTIAL && cfg->share_jfr == true &&
+        cfg->jettys_pre_jfr != 1) {
+        cfg->jettys_pre_jfr = 1;
     }
 
     /* --mode only for BW tests */
