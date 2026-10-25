@@ -1,60 +1,105 @@
 # UBBench
 
-UBench 是用于 URMA 时延和带宽测试的性能工具，基于 urma_perftest 演进。涵盖收发、读、写、原子操作等四类语义，每种语义支持时延和带宽测试。区分 server 端和 client 端分别启动 ub_bench 进程开展测试并输出测试结果。
+UBBench 是用于 URMA 时延和带宽测试的性能工具，基于 urma_perftest 演进。涵盖收发（send）、读（read）、写（write）、原子操作（atomic）四类语义，每种语义支持时延（lat）和带宽（bw）测试。区分 server 端和 client 端分别启动 `ub_bench` 进程开展测试并输出结果。
 
-ub_bench 完全兼容 urma_perftest 的所有命令和参数，并新增顺序模式带宽测试、QPS 限速、QPS 扫描、多线程、带宽与时延同时采集等特性。
+`ub_bench` 兼容 urma_perftest 的命令与参数，并在此基础上新增带宽与时延联合测量（逐包采集完成时延并输出 p99/p999 等分位数）、QPS 限速与扫描（自动寻找带宽-时延拐点）、多线程并行测试等能力。
 
-## 1. 命令格式
+## 目录
 
+- [编译](#编译)
+- [快速开始](#快速开始)
+- [特性](#特性)
+  - [时延直方图](#时延直方图)
+  - [两种带宽模式](#两种带宽模式)
+- [命令](#命令)
+- [参数](#参数)
+  - [新增参数](#新增参数)
+  - [原有参数](#原有参数)
+- [约束](#约束)
+  - [urma_perftest 原有约束](#urma_perftest-原有约束)
+  - [ub_bench 新增约束](#ub_bench-新增约束)
+- [示例](#示例)
+- [报告格式](#报告格式)
+
+## 编译
+
+### 依赖
+
+| 依赖项 | 说明 |
+|--------|------|
+| UMDK (liburma + liburma_common) | URMA 用户态驱动库 |
+| urma 头文件 | urma_api.h / urma_types.h / urma_opcode.h 等，路径 `/usr/include/ub/umdk/urma/` |
+| CMake ≥ 3.10 | 构建系统 |
+| C 编译器 (C99) | gcc / aarch64-linux-gnu-gcc |
+| pthread / libm | 线程 + 数学库 |
+
+> 目标平台：Linux（x86_64 / aarch64）。需先安装 UMDK 以提供 urma 头文件与用户态驱动库。
+
+### 编译步骤
+
+```bash
+cd UBBench
+mkdir build && cd build
+cmake ..
+make -j$(nproc)
 ```
-Usage: ub_bench command [command options]
-ub_bench URMA benchmark tool
-Command syntax:
-  read_lat       Test for read latency.
-  write_lat      Test for write latency.
-  send_lat       Test for send latency.
-  atomic_lat     Test for atomic latency.
-  read_bw        Test for read bandwidth.
-  write_bw       Test for write bandwidth.
-  send_bw        Test for send bandwidth.
-  atomic_bw      Test for atomic bandwidth.
+
+编译产物：`build/ub_bench`
+
+### 编译选项
+
+| 选项 | 说明 |
+|------|------|
+| `ASAN=enable` | 启用 AddressSanitizer + LeakSanitizer + UBSan |
+| `CROSS_COMPILE=<prefix>` | 交叉编译工具链前缀 |
+
+## 快速开始
+
+最小可用命令（TCP 管理通道）：
+
+```bash
+# server 端（本机）
+ub_bench write_lat -d <DEV_NAME> -s 65536 -n 100000
+
+# client 端（连接 server）
+ub_bench write_lat -d <DEV_NAME> -s 65536 -n 100000 -S <SERVER_IP>
 ```
 
-## 2. 功能描述
+其中 `<DEV_NAME>` 为 UB 设备名（如 `ubep_beta`，可用 `urma_admin show -a` 查询），`<SERVER_IP>` 为 server 端 IP。带宽测试同理，把 `write_lat` 换成 `write_bw` 即可。
 
-```
-收发时延测试server端：ub_bench send_lat -d <DEV_NAME> -s [SIZE] -n [ITERATIONS]
-收发时延测试client端：ub_bench send_lat -d <DEV_NAME> -s [SIZE] -n [ITERATIONS] -S <SERVER_IP>
-读时延测试server端：ub_bench read_lat -d <DEV_NAME> -s [SIZE] -n [ITERATIONS]
-读时延测试client端：ub_bench read_lat -d <DEV_NAME> -s [SIZE] -n [ITERATIONS] -S <SERVER_IP>
-写时延测试server端：ub_bench write_lat -d <DEV_NAME> -s [SIZE] -n [ITERATIONS]
-写时延测试client端：ub_bench write_lat -d <DEV_NAME> -s [SIZE] -n [ITERATIONS] -S <SERVER_IP>
-原子操作时延测试server端：ub_bench atomic_lat -d <DEV_NAME> -s [SIZE] -n [ITERATIONS] -A cas
-原子操作时延测试client端：ub_bench atomic_lat -d <DEV_NAME> -s [SIZE] -n [ITERATIONS] -S <SERVER_IP> -A cas
-收发带宽测试server端：ub_bench send_bw -d <DEV_NAME> -s [SIZE] -n [ITERATIONS]
-收发带宽测试client端：ub_bench send_bw -d <DEV_NAME> -s [SIZE] -n [ITERATIONS] -S <SERVER_IP>
-读带宽测试server端：ub_bench read_bw -d <DEV_NAME> -s [SIZE] -n [ITERATIONS]
-读带宽测试client端：ub_bench read_bw -d <DEV_NAME> -s [SIZE] -n [ITERATIONS] -S <SERVER_IP>
-写带宽测试server端：ub_bench write_bw -d <DEV_NAME> -s [SIZE] -n [ITERATIONS]
-写带宽测试client端：ub_bench write_bw -d <DEV_NAME> -s [SIZE] -n [ITERATIONS] -S <SERVER_IP>
-原子操作带宽测试server端：ub_bench atomic_bw -d <DEV_NAME> -s [SIZE] -n [ITERATIONS] -A cas
-原子操作带宽测试client端：ub_bench atomic_bw -d <DEV_NAME> -s [SIZE] -n [ITERATIONS] -S <SERVER_IP> -A cas
-```
+四类语义 × 两种模式共 8 个子命令：
 
-## 3. 新增特性
+|  | 时延 (lat) | 带宽 (bw) |
+|---|---|---|
+| 收发 send | `send_lat` | `send_bw` |
+| 读 read | `read_lat` | `read_bw` |
+| 写 write | `write_lat` | `write_bw` |
+| 原子 atomic | `atomic_lat` | `atomic_bw` |
 
-ub_bench 在 urma_perftest 基础上新增以下特性：
+> 原子操作类型默认 `cas`（可用 `-A faa` 切换），`-s` 默认即 8 且不允许改为其他值。
+
+## 特性
+
+`ub_bench` 在 urma_perftest 基础上新增以下特性：
 
 | 特性 | 参数 | 说明 |
 |------|------|------|
-| 带宽 + 时延同时采集 | sequential 模式默认 | 逐包采集完成时延（log2 直方图），同时输出带宽和时延分位数（p99/p999/p9999/p99999） |
+| 带宽 + 时延同时采集 | sequential 模式默认 | 逐包采集完成时延，同时输出带宽和时延分位数（p99/p999/p9999/p99999） |
 | 顺序模式 | `--mode sequential`（默认） | 1 WR 在途逐包发送，支持 QPS 限速和时延采集 |
-| 流水线模式 | `--mode pipeline` | 深队列批量收发，等价 urma_perftest 行为 |
+| 流水线模式 | `--mode pipeline` | 深队列批量收发，对标 urma_perftest（`--bw-only` 时完全等价） |
 | QPS 限速 | `--qps <Q>` | 每线程精确发包间隔，总 QPS = threads × qps |
 | QPS 扫描 | `--sweep <start:end:step>` | 线性扫描不同 QPS，自动找到带宽时延拐点 |
 | 多线程 | `--threads <N>` | 每线程独立 jetty + JFC，无锁并行收发 |
 | 纯带宽模式 | `--bw-only` | 跳过时延采集，pipeline 模式下等价 urma_perftest |
-| send_bw 多线程服务端 | sequential 模式 | 服务端每线程独立 JFC 收包，独立 BW 测量 |
+
+### 时延直方图
+
+sequential 模式逐包采集 WR 完成时延（`tcompleted - tposted`），写入 log2 直方图：
+
+- **桶设计**：log2 量级 + 线性子桶。每个 2 倍区间内 512 个线性子桶（`HIST_SUB_BITS=9`），共 28 个量级（`HIST_MAX_MAG=28`），上限 2^28 cycles（≈111ms @2.4GHz），总桶数 28×512=14336。
+- **百分位算法**：nearest-rank。从最大桶向下累计计数，累计超过 `(1-p)·N` 时返回该桶代表的时延值。
+- **内存开销**：每线程约 56KB；多线程在结束时通过 `hist_merge` 合并为全局直方图后输出分位数。
+- **精度说明**：BW 模式的时延是 WR 完成时间（post → CQE），不除以 2，测量方式与 `read_lat`/`atomic_lat` 一致（`rtt_factor=1`）。区别于 `write_lat`/`send_lat` 的 ping-pong 模型（`rtt_factor=2`，报告 RTT/2 单向估算）。如需对标 urma_perftest LAT 基线，使用 `*_lat` 命令。
 
 ### 两种带宽模式
 
@@ -64,17 +109,33 @@ ub_bench 在 urma_perftest 基础上新增以下特性：
 | jfs_depth | 1（强制） | 128（默认） |
 | cq_mod | 1（强制） | 100（默认） |
 | 时延采集 | 逐包精确（tcompleted - tposted → hist） | user_ctx 携带时戳，CQE 回传 |
-| --qps | 支持 | 不支持 |
-| --sweep | 支持 | 不支持 |
-| --bw-only | 可关闭时延采集 | 可关闭时延采集 |
-| -y（infinite） | 不支持 | 支持 |
+| `--qps` | 支持 | 不支持 |
+| `--sweep` | 支持 | 不支持 |
+| `--bw-only` | 可关闭时延采集 | 可关闭时延采集 |
+| `-y`（infinite） | 不支持 | 支持 |
 | 等价 urma_perftest | 否 | `--mode pipeline --bw-only` 等价 |
 
-## 4. 参数说明
+## 命令
 
-ub_bench 参数分为两类：继承自 urma_perftest 的原有参数，以及 ub_bench 新增参数。
+```
+Usage: ub_bench command [command options]
+  ub_bench   UB benchmark tool
+Command syntax:
+  read_lat                    Test for read latency.
+  write_lat                   Test for write latency.
+  send_lat                    Test for send latency.
+  atomic_lat                  Test for atomic latency.
+  read_bw                     Test for read bandwidth.
+  write_bw                    Test for write bandwidth.
+  send_bw                     Test for send bandwidth.
+  atomic_bw                   Test for atomic bandwidth.
+```
 
-### 4.1 新增参数
+## 参数
+
+`ub_bench` 参数分为两类：继承自 urma_perftest 的原有参数，以及 `ub_bench` 新增参数。
+
+### 新增参数
 
 ```
 Options (ub_bench extensions):
@@ -84,21 +145,21 @@ Options (ub_bench extensions):
                               Total QPS = threads * qps.
   --sweep <start:end:step>    Linear QPS sweep, per-thread. Each step adds <step>.
   --sweep-duration <sec>      Seconds per sweep step, default 10.
-  --bw-only                    Skip latency collection, pure bandwidth test.
+  --bw-only                   Skip latency collection, pure bandwidth test.
 ```
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--mode` | enum | sequential | BW 测试模式：sequential / pipeline |
 | `--threads` | uint32 | 1 | 工作线程数，每线程独立 jetty + JFC（1 线程 = 1 jetty） |
-| `--qps` | uint64 | 0 | 每线程 QPS 限速（0 = 不限速），仅 sequential 模式 |
+| `--qps` | uint64 | 0 | 每线程 QPS 限速（0 = 不限速），仅 sequential 模式。采用 busy-wait 自旋实现，每个 worker 线程 100% CPU 占用，精度高但耗 CPU |
 | `--sweep` | string | — | QPS 扫描 `start:end:step`，仅 sequential 模式 |
-| `--sweep-duration` | uint32 | 10 | 每步扫描持续时间（秒） |
+| `--sweep-duration` | uint32 | 10 | 每步扫描持续时间（秒）。每步按固定时长运行（由 `time_limit_cycles` 控制，非迭代数）；总扫描点数 = `(end-start)/step + 1` |
 | `--bw-only` | flag | false | 跳过时延采集，纯带宽测试 |
 
-### 4.2 原有参数
+### 原有参数
 
-ub_bench 保留 urma_perftest 的全部参数：
+`ub_bench` 保留 urma_perftest 的全部参数：
 
 ```
 Options:
@@ -108,7 +169,7 @@ Options:
   -b, --simplex_mode          Run with simplex mode(jfs/jfr), duplex jetty mode for reserved.
   -B, --bidirection           Measure bidirectional bandwidth (default unidirectional).
   -c, --jfc_inline            Enable jfc_inline to upgrade latency performance.
-  -C, --jfc_depth <dep>       Size of jfc depth (default 4096 for bw, 1024 for ip bw, 512 for lat.
+  -C, --jfc_depth <dep>       Size of jfc depth (default 4096 for bw, 1024 for ip bw, 1 for lat.
   -d, --dev <dev_name>        The name of ubep device.
   -D, --duration <second>     Run test for a customized period of seconds, this cfg covers iters.
   -e, --use_jfce              use jfc event.
@@ -137,8 +198,8 @@ Options:
   -S, --server <addr>         TCP mode: server ip for bind or connect, default: 127.0.0.1.
                               UB mode: server mgmt eid (required for client).
   -T, --jfs_depth <dep>       Size of jfs depth (default 128 for BW, 1 for LAT).
-  -u, --uboe                  Enable uboe (default false), the parametre sip, dip are required.
-                                                                            dscp, vlan, sl are optional
+  -u, --uboe                  Enable uboe (default false), sip, dip are required, dscp, vlan, sl are optional.
+  -V, --version               Show the version.
   -w, --warm_up               Choose to use warm_up function, only for read/write/atomic bw test.
   -y, --infinite[second]      Run perftest infinitely, only available for BW test.
                               Print period for infinite mode, default 2 seconds.
@@ -188,7 +249,8 @@ Options:
   --hugepage_size <size>      Page size for allocated memory. Only support 2MB or 1GB currently.
   --mgmt_addr <eid>           UB only: local eid string for mgmt channel (required in UB mode).
   --bond_mode                 Set bonding device mode, support: standalone, active_backup, balance.
-  --bond_level                Set bonding device level, support: iodie, port.
+                              default: standalone.
+  --bond_level                Set bonding device level, support: iodie, port, default: iodie.
   --bw_unit <unit>            Set bandwidth display unit: KB, MB, or GB (default: MB).
   --va <address>              Allow user to set address for local_buf, (Both decimal and hexadecimal).
   --share_jfs                 Create ONLY ONE jfs in multi-play-multi mode bw test.
@@ -196,9 +258,9 @@ Options:
   --max_size                  Set max size in random io size, only for bw mode.
 ```
 
-## 5. 参数约束
+## 约束
 
-### 5.1 urma_perftest 原有约束
+### urma_perftest 原有约束
 
 1. 冲突的配置原则上不允许同时配置，例如 -a 和 -s、-D 和 -n 等；
 2. 参数 -d 和 client 端的 -S 为必填项；
@@ -206,7 +268,7 @@ Options:
 4. 读/原子操作未使用 inline_size，配置 -I 会提示不生效，并且 inline_size 强制取 0；
 5. -J 多个 jetty 仅能在带宽测试中配置，在时延测试中配置会返回错误；
 6. -N 无峰值计算配置仅用于带宽测试，时延测试配置会返回失败；
-7. 当前对 -n、-T、-J、-I、-R 和 -Q 有严格的范围限制，超出返回会告警提示并返回失败；
+7. 当前对 -n、-T、-J、-R、-Q 等参数有严格的范围限制，超出会告警提示并返回失败；
 8. 原子操作语义配置 -s 不等于 8 时，产生告警提示并返回失败；
 9. 当配置 jfs_post_list/jfr_post_list 超过 1，在带宽测试迭代模式(-n)下，若迭代次数不能整除 jfs_post_list/jfr_post_list 则产生告警提示并返回失败；
 10. 当配置 jfs_post_list 超过 1，在带宽测试中，cq_mod 为 0 时，将强制取其等于 jfs_post_list；
@@ -214,24 +276,24 @@ Options:
 12. 双边操作 -B 只能配合带宽测试，时延测试配置 -B 会报错；
 13. 配置 -f 只能在配置 -b 的前提下，否则会报错；
 
-### 5.2 ub_bench 新增约束
+### ub_bench 新增约束
 
 1. `--mode pipeline` 仅用于 BW 测试；
 2. `--qps` 仅用于 BW sequential 模式，与 `--sweep`、`--rate_limit` 互斥；
-3. `--sweep` 仅用于 BW sequential 模式，不支持 send_bw 和 bidirection；
+3. `--sweep` 仅用于 BW sequential 模式，不支持 send_bw（服务端收包为计数驱动，无法匹配时间驱动的 sweep 步长）和 bidirection；
 4. `--mode sequential` 不支持 `--infinite`(-y)、`--bidirection`(-B)、`--all`(-a)；
 5. `--threads > 1` 仅用于 BW 测试，不支持 `--infinite`(-y)；
 6. `--bidirection`(-B) 不支持 sequential 模式、多线程、pipeline + 非 bw_only；
 7. `--bw-only` 仅用于 BW 测试；
-8. sequential 模式强制 `jfs_depth=1`、`cq_mod=1`、`jfr_post_list=1`（用户配置的 -T、-Q、-r 被覆盖）；
-9. pipeline + 非 bw_only 强制 `cq_mod=1`，`jettys > 1` 且 `threads == 1` 时自动提升 `threads = jettys`；
+8. sequential 模式强制 `jfs_depth=1`、`cq_mod=1`、`jfr_post_list=1`（用户配置的 -T、-Q、-r 被覆盖）；同时自动设 `no_peak=false`（非 bw_only 且非 duration 模式时）；
+9. pipeline + 非 bw_only 强制 `cq_mod=1`，并自动设 `no_peak=false`（非 duration 模式时）；此时若 `jettys > 1` 且 `threads == 1`，自动提升 `threads = jettys`（每 jetty 一个 worker）；
 10. `--threads > 1` 时强制 `jettys = threads`（1 线程 = 1 jetty）；
-11. send_bw 服务端：sequential + 非 credit + 非 jfce 时支持多线程收包；pipeline / credit / jfce 模式强制 `threads=1`；
-12. `--sweep` 与 `--qps`、`--rate_limit` 互斥；
+11. send_bw 服务端：sequential + 非 credit + 非 jfce 时支持多线程收包；pipeline / credit / jfce 模式强制 `threads=1`（需共享 CQ）；sequential + 多线程 + `--share_jfr` 时自动设 `jettys_pre_jfr=1`（每 jetty 独立 jfr/JFC，支持 per-thread 收包）；
+12. `--sweep` 与 `--qps`、`--rate_limit` 互斥；sweep 模式下 `time_type` 被清零（既非 duration 也非 iterations），由每步 `time_limit_cycles` 控制时长。
 
-## 6. 使用示例
+## 示例
 
-### 6.1 时延测试
+### 时延测试
 
 ```bash
 # server 端
@@ -241,141 +303,102 @@ ub_bench write_lat -d <DEV_NAME> -s 65536 -n 100000
 ub_bench write_lat -d <DEV_NAME> -s 65536 -n 100000 -S <SERVER_IP>
 ```
 
-### 6.2 带宽 + 时延联合测试（sequential 模式，默认）
+### 带宽 + 时延联合测试（sequential 模式，默认）
 
 ```bash
 # server 端
-ub_bench write_bw -d <DEV_NAME> --ctp --tp_aware --eid_idx 0 -P 21135 -s 8388608 -D 10
+ub_bench write_bw -d <DEV_NAME> -D 10
 
 # client 端
-ub_bench write_bw -d <DEV_NAME> --ctp --tp_aware --eid_idx 0 -P 21135 -s 8388608 -D 10 -S <SERVER_IP>
+ub_bench write_bw -d <DEV_NAME> -D 10 -S <SERVER_IP>
 ```
 
-输出示例：
-```
----- ub_bench Report ----
- bytes       iterations  QPS          BW_avg[MiB/s]  MsgRate[Mpps]  t_min[us]  t_max[us]  t_median[us]  t_avg[us]  99%[us]  99.9%[us]  99.99%[us]  99.999%[us]
- 8388608     5419        5419         43353.32       0.005419       186.25     3387.03    353.92        368.95     622.72   901.12     1420.80     3384.31
-```
-
-### 6.3 多线程带宽测试
+### 多线程带宽测试
 
 ```bash
-# 4 线程，每线程独立 jetty + JFC
 # server 端
-ub_bench write_bw -d <DEV_NAME> --ctp --tp_aware --eid_idx 0 -P 21135 \
-    -s 65536 --threads 4 -D 10
+ub_bench write_bw -d <DEV_NAME> --threads 4 -D 10
 
 # client 端
-ub_bench write_bw -d <DEV_NAME> --ctp --tp_aware --eid_idx 0 -P 21135 \
-    -s 65536 --threads 4 -D 10 -S <SERVER_IP>
+ub_bench write_bw -d <DEV_NAME> --threads 4 -D 10 -S <SERVER_IP>
 ```
 
-### 6.4 send_bw 多线程（服务端独立 BW）
+### send_bw 多线程
 
 ```bash
-# server 端（sequential 模式支持多线程收包）
-ub_bench send_bw -d <DEV_NAME> --ctp --tp_aware --eid_idx 0 -P 21135 \
-    -s 65536 --threads 4 -D 10
+# server 端
+ub_bench send_bw -d <DEV_NAME> --threads 4 -D 10
 
 # client 端
-ub_bench send_bw -d <DEV_NAME> --ctp --tp_aware --eid_idx 0 -P 21135 \
-    -s 65536 --threads 4 -D 10 -S <SERVER_IP>
+ub_bench send_bw -d <DEV_NAME> --threads 4 -D 10 -S <SERVER_IP>
 ```
 
-服务端输出（send_bw 独立 BW，无时延列）：
-```
----- ub_bench Report ----
- bytes       iterations  QPS          BW_avg[MiB/s]  MsgRate[Mpps]
- 65536       4985        4985         39880.00       0.004985
-```
-
-### 6.5 QPS 限速测试
+### QPS 限速测试
 
 ```bash
 # 每线程 100K QPS，4 线程，总 400K QPS
-ub_bench write_bw -d <DEV_NAME> --ctp --tp_aware --eid_idx 0 -P 21135 \
-    -s 65536 --threads 4 --qps 100000 -D 10 -S <SERVER_IP>
+ub_bench write_bw -d <DEV_NAME> --threads 4 --qps 100000 -D 10 -S <SERVER_IP>
 ```
 
-### 6.6 QPS 扫描（找带宽时延拐点）
+### QPS 扫描（找带宽时延拐点）
 
 ```bash
 # 从 100K 到 1M QPS，步长 100K，每步 10 秒
-ub_bench write_bw -d <DEV_NAME> --ctp --tp_aware --eid_idx 0 -P 21135 \
-    -s 65536 --threads 4 \
+ub_bench write_bw -d <DEV_NAME> --threads 4 \
     --sweep 100000:1000000:100000 --sweep-duration 10 -S <SERVER_IP>
 ```
 
-### 6.7 纯带宽测试（pipeline 模式，对标 urma_perftest）
+### 纯带宽测试（pipeline 模式，对标 urma_perftest）
 
 ```bash
 # server 端
-ub_bench write_bw -d <DEV_NAME> --ctp --tp_aware --eid_idx 0 -P 21135 \
-    -s 65536 --mode pipeline --bw-only -y
+ub_bench write_bw -d <DEV_NAME> --mode pipeline --bw-only -y
 
 # client 端
-ub_bench write_bw -d <DEV_NAME> --ctp --tp_aware --eid_idx 0 -P 21135 \
-    -s 65536 --mode pipeline --bw-only -y -S <SERVER_IP>
+ub_bench write_bw -d <DEV_NAME> --mode pipeline --bw-only -y -S <SERVER_IP>
 ```
 
-## 7. 报告格式说明
+## 报告格式
 
-### 客户端报告（所有 BW 命令）
+### 客户端报告
+
+sequential 模式与 pipeline 模式的输出格式不同：
+
+**sequential 模式**：
 
 | 列 | 说明 |
 |---|---|
 | bytes | 消息大小 |
 | iterations | 总收发包数 |
-| QPS | 实际吞吐速率（包/秒） |
+| QPS_actual | 实际吞吐速率（包/秒） |
 | BW_avg | 平均带宽 |
 | MsgRate | 消息速率（Mpps） |
 | t_min / t_max | 最小 / 最大时延（微秒） |
 | t_median / t_avg | 中位数 / 平均时延（微秒） |
-| 99% / 99.9% / 99.99% / 99.999% | 时延分位数（微秒） |
+| 99% / 99.9% / 99.99% / 99.999% | 时延分位数（微秒，nearest-rank） |
+
+> `--bw-only` 时省略 t_min~99.999% 时延列。
+
+**pipeline 模式**：
+
+| 列 | 说明 |
+|---|---|
+| actual_QPS | 实际吞吐速率（包/秒） |
+| target_QPS | 目标 QPS（pipeline 模式不支持 `--qps`，该列恒为 0） |
+| BW_avg | 平均带宽 |
+| MsgRate | 消息速率（Mpps） |
+| t_min / t_median / t_avg | 最小 / 中位 / 平均时延（微秒） |
+| P99 / P99.9 / P99.99 / P99.999 / Pmax | 时延分位数及最大值（微秒） |
 
 ### 服务端报告
 
 | 命令 | 服务端输出 | 说明 |
 |------|-----------|------|
-| send_bw | BW only（无时延列） | 服务端独立 BW（用自己的计数和时间窗口） |
-| write_bw / read_bw / atomic_bw | 完整报告（BW + 时延） | 数据来自客户端 sync |
+| send_bw | BW only（无时延列） | 服务端独立计数，client 端输出完整报告（BW + 时延） |
+| write_bw / read_bw / atomic_bw | 完整报告（BW + 时延） | 服务端不独立测量，数据来自客户端 sync |
 
-### 时延说明
+### 时延语义
 
-BW 模式的时延是 WR 完成时间（post → CQE），包含 post 开销 + 单程数据传输 + ACK 返回 + poll 检测。不除以 2（不是 RTT/2 单向估算）。与 LAT 模式的 RTT/2 不同，如需对标 urma_perftest LAT 基线，使用 `write_lat` 命令。
+BW 模式的时延是 WR 完成时间（post → CQE），不除以 2，测量方式与 `read_lat`/`atomic_lat` 一致（`rtt_factor=1`）。区别于 `write_lat`/`send_lat` 的 ping-pong 模型（`rtt_factor=2`，报告 RTT/2 单向估算）。如需对标 urma_perftest LAT 基线，使用 `*_lat` 命令。
 
-## 8. 编译
 
-### 依赖
-
-| 依赖项 | 说明 |
-|--------|------|
-| UMDK (liburma + liburma_common) | URMA 用户态驱动库 |
-| urma 头文件 | urma_api.h / urma_types.h / urma_opcode.h 等，路径 /usr/include/ub/umdk/urma/ |
-| CMake ≥ 3.10 | 构建系统 |
-| C 编译器 (C99) | gcc / aarch64-linux-gnu-gcc |
-| pthread / libm | 线程 + 数学库 |
-
-### 编译步骤
-
-```bash
-cd UBBench
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-```
-
-编译产物：`build/ub_bench`
-
-### 编译选项
-
-| 选项 | 说明 |
-|------|------|
-| ASAN=enable | 启用 AddressSanitizer + LeakSanitizer + UBSan |
-| PERF_CYCLE=enable | 启用精确周期计数 |
-| CROSS_COMPILE=<prefix> | 交叉编译工具链前缀 |
-
-## 9. 许可
-
-MIT License
