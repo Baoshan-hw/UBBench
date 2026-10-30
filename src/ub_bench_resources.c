@@ -2950,7 +2950,9 @@ static void destroy_simplex_ctx(perftest_context_t *ctx, perftest_config_t *cfg)
     disconnect_jfr(ctx, cfg);
     unimport_seg(ctx, (int)ctx->jetty_num);
     for (uint32_t i = 0; i < cfg->pair_num; i++) {
-        (void)sync_time(cfg, i, "unimport_jfr");
+        if (!ctx->run_ctx.abort) {
+            (void)sync_time(cfg, i, "unimport_jfr");
+        }
     }
     if (cfg->enable_notify == true) {
         unimport_notify(ctx, ctx->jetty_num);
@@ -2989,7 +2991,9 @@ static void destroy_duplex_ctx(perftest_context_t *ctx, perftest_config_t *cfg)
     drain_inflight_wr(ctx, cfg);
     disconnect_jetty(ctx, cfg);
     for (uint32_t i = 0; i < cfg->pair_num; i++) {
-        (void)sync_time(cfg, i, "unimport_jetty");
+        if (!ctx->run_ctx.abort) {
+            (void)sync_time(cfg, i, "unimport_jetty");
+        }
     }
     if (cfg->enable_notify == true) {
         unimport_notify(ctx, ctx->jetty_num);

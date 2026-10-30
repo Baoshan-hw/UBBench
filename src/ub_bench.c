@@ -87,7 +87,7 @@ static int run_test(perftest_context_t *ctx, perftest_config_t *cfg)
 
     if (ret != 0) {
         LOG_ERROR("Failed to run test: %d.\n", (int)cfg->cmd);
-        return ret;
+        _exit(1);
     }
     if (!g_exit_flag) {
         for (i = 0; i < cfg->pair_num; i++) {
@@ -155,6 +155,7 @@ static void *write_dirty_thread(void *args)
 
 static int prepare_test(perftest_context_t *ctx, perftest_config_t *cfg, context_cfg_t *args)
 {
+    ctx->run_ctx.abort = 0;
     print_cfg(cfg);
     if (cfg->use_jfce == true) {
         if (rearm_jfc(ctx, cfg) != 0) {

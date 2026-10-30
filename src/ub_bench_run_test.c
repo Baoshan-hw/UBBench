@@ -2054,8 +2054,8 @@ static void *run_once_bw_thread(void *arg)
 
     t->start_time = get_cycles();
 
-    while (scnt < tot_iters || ccnt < tot_iters ||
-           (cfg->time_type.bs.duration == 1 && run_ctx->state != END_STATE)) {
+    while (!run_ctx->abort && (scnt < tot_iters || ccnt < tot_iters ||
+           (cfg->time_type.bs.duration == 1 && run_ctx->state != END_STATE))) {
 
         if (cfg->time_type.bs.duration == 1) {
             if (run_ctx->state == END_STATE) {
@@ -2131,7 +2131,15 @@ static void *run_once_bw_thread(void *arg)
             if (cqe_cnt > 0) {
                 for (int i = 0; i < cqe_cnt; i++) {
                     if (cr[i].status != URMA_CR_SUCCESS) {
-                        LOG_ERROR("Thread %u: CR status %d.\n", id, (int)cr[i].status);
+                        if (__sync_bool_compare_and_swap(&run_ctx->abort, 0, 1)) {
+                            LOG_ERROR("CR error: %s (status %d), thread %u.\n",
+                                      cr_status_str((int)cr[i].status), (int)cr[i].status, id);
+                            if (cr[i].status == URMA_CR_ACK_TIMEOUT_ERR) {
+                                LOG_ERROR("Hint: try reducing --threads or -s.\n");
+                            } else if (cr[i].status == URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
+                                LOG_ERROR("Hint: receiver buffer exhausted, try increasing -R or reducing --threads.\n");
+                            }
+                        }
                         free(cr);
                         t->end_time = get_cycles();
                         return (void *)(intptr_t)(-1);
@@ -2225,6 +2233,7 @@ static int run_once_bw_mt(perftest_context_t *ctx, perftest_config_t *cfg)
     }
 
     if (worker_err != 0) {
+        ctx->run_ctx.abort = 1;
         free(args);
         return -1;
     }

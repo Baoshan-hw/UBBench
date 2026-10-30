@@ -35,6 +35,20 @@ static inline bool perftest_is_bonding_dev(const char *dev_name)
     return memcmp(dev_name, "bonding_dev", strlen("bonding_dev")) == 0;
 }
 
+static inline const char *cr_status_str(int status)
+{
+    switch ((urma_cr_status_t)status) {
+        case URMA_CR_ACK_TIMEOUT_ERR:       return "ACK_TIMEOUT";
+        case URMA_CR_RNR_RETRY_CNT_EXC_ERR: return "RNR_RETRY_EXCEEDED";
+        case URMA_CR_WR_FLUSH_ERR:          return "WR_FLUSHED";
+        case URMA_CR_REM_ACCESS_ABORT_ERR:  return "REMOTE_ACCESS_ABORT";
+        case URMA_CR_REM_OPERATION_ERR:     return "REMOTE_OP_ERR";
+        case URMA_CR_LOC_ACCESS_ERR:        return "LOCAL_ACCESS_ERR";
+        case URMA_CR_LOC_LEN_ERR:           return "LOCAL_LEN_ERR";
+        default:                            return "UNKNOWN";
+    }
+}
+
 typedef enum duration_states {
     WARMUP_STATE,
     START_STATE,
@@ -57,6 +71,7 @@ typedef struct perftest_tp_info {
 typedef struct run_test_ctx {
     uint32_t duration;
     volatile duration_states_t state;
+    volatile int abort;
     uint64_t rid;
     uint64_t *tposted;    // cycles
     uint64_t *tcompleted; // cycles

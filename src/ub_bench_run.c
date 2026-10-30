@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <unistd.h>
 #include <stdbool.h>
 
@@ -94,7 +95,7 @@ static void *sequential_worker(void *arg)
         int cqe_cnt;
         do {
             cqe_cnt = urma_poll_jfc(ctx->jfc_s[id], 1, &cr);
-        } while (cqe_cnt == 0 &&
+        } while (cqe_cnt == 0 && !run_ctx->abort &&
                  (cfg->time_type.bs.iterations == 1 || run_ctx->state != END_STATE));
 
         if (cqe_cnt < 0) {
@@ -106,7 +107,15 @@ static void *sequential_worker(void *arg)
             break;
         }
         if (cr.status != URMA_CR_SUCCESS) {
-            LOG_ERROR("Bad CR status, thread %u, status %d.\n", id, (int)cr.status);
+            if (__sync_bool_compare_and_swap(&run_ctx->abort, 0, 1)) {
+                LOG_ERROR("CR error: %s (status %d), thread %u.\n",
+                          cr_status_str((int)cr.status), (int)cr.status, id);
+                if (cr.status == URMA_CR_ACK_TIMEOUT_ERR) {
+                    LOG_ERROR("Hint: try reducing --threads or -s.\n");
+                } else if (cr.status == URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
+                    LOG_ERROR("Hint: receiver buffer exhausted, try increasing -R or reducing --threads.\n");
+                }
+            }
             t->end_time = get_cycles();
             return (void *)(intptr_t)(-1);
         }
@@ -169,7 +178,13 @@ static void *recv_server_worker(void *arg)
 
     t->start_time = get_cycles();
 
+    time_t last_recv_time = time(NULL);
+    uint64_t idle_count = 0;
+
     while (1) {
+        if (run_ctx->abort) {
+            break;
+        }
         if (cfg->time_type.bs.duration == 1) {
             if (run_ctx->state == END_STATE) {
                 break;
@@ -184,9 +199,29 @@ static void *recv_server_worker(void *arg)
             return (void *)(intptr_t)(-1);
         }
 
+        if (cqe_cnt > 0) {
+            last_recv_time = time(NULL);
+            idle_count = 0;
+        } else if (++idle_count % 1000000 == 0) {
+            if (time(NULL) - last_recv_time > 10) {
+                if (__sync_bool_compare_and_swap(&run_ctx->abort, 0, 1)) {
+                    LOG_ERROR("Timeout: no data for 10s, peer may have disconnected.\n");
+                }
+                break;
+            }
+        }
+
         for (int i = 0; i < cqe_cnt; i++) {
             if (cr[i].status != URMA_CR_SUCCESS) {
-                LOG_ERROR("Bad CR status, thread %u, status %d.\n", id, (int)cr[i].status);
+                if (__sync_bool_compare_and_swap(&run_ctx->abort, 0, 1)) {
+                    LOG_ERROR("CR error: %s (status %d), thread %u.\n",
+                              cr_status_str((int)cr[i].status), (int)cr[i].status, id);
+                    if (cr[i].status == URMA_CR_ACK_TIMEOUT_ERR) {
+                        LOG_ERROR("Hint: try reducing --threads or -s.\n");
+                    } else if (cr[i].status == URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
+                        LOG_ERROR("Hint: receiver buffer exhausted, try increasing -R or reducing --threads.\n");
+                    }
+                }
                 free(cr);
                 t->end_time = get_cycles();
                 return (void *)(intptr_t)(-1);
@@ -449,6 +484,7 @@ static int run_sequential_client(perftest_context_t *ctx, perftest_config_t *cfg
     }
 
     if (worker_err != 0) {
+        ctx->run_ctx.abort = 1;
         free(args);
         return -1;
     }
@@ -594,7 +630,7 @@ static int run_sweep_client(perftest_context_t *ctx, perftest_config_t *cfg)
         }
 
         if (worker_err != 0) {
-            LOG_ERROR("Worker thread failed in sweep step %u.\n", s);
+            ctx->run_ctx.abort = 1;
             free(args);
             free(results);
             return -1;
@@ -740,6 +776,7 @@ static int run_recv_server_mt(perftest_context_t *ctx, perftest_config_t *cfg)
     }
 
     if (worker_err != 0) {
+        ctx->run_ctx.abort = 1;
         free(args);
         return -1;
     }
