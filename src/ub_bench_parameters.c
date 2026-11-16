@@ -1840,9 +1840,15 @@ int check_local_cfg(perftest_config_t *cfg)
 
     /* sequential mode settings */
     if (cfg->type == PERFTEST_BW && cfg->mode == PERFTEST_MODE_SEQUENTIAL) {
+        if (cfg->jfs_depth != 1 || cfg->cq_mod != 1 || cfg->jfs_post_list != 1 || cfg->jfr_post_list != 1) {
+            LOG_INFO("sequential mode: jfs_depth/cq_mod/jfs_post_list/jfr_post_list forced to 1 "
+                     "(per-packet latency requires 1 WR in flight). "
+                     "Use --mode pipeline for deep queues.\n");
+        }
         cfg->jfs_depth = 1;
         cfg->cq_mod = 1;
         cfg->jfr_post_list = 1;
+        cfg->jfs_post_list = 1;
         if (cfg->bw_only == false && cfg->time_type.bs.duration != 1) {
             cfg->no_peak = false;
         }
