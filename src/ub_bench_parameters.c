@@ -28,9 +28,9 @@
 #define PERFTEST_JFC_MUL_THRESHOLD    (4)
 #define PERFTEST_DEFAULT_DURATION     (5)
 
-#define PERFTEST_RTP_MAX_SEND_SIZE (65536)
+#define PERFTEST_TP_MAX_SEND_SIZE (65536)
 #define PERFTEST_CTP_MAX_SEND_SIZE (4096)
-#define PERFTEST_RTP_MAX_ORDER     (16)
+#define PERFTEST_TP_MAX_ORDER     (16)
 #define PERFTEST_CTP_MAX_ORDER     (12)
 
 typedef struct perftest_cmd {
@@ -79,6 +79,34 @@ static const perftest_cmd_t g_cmd[] = {
     {"send_bw", PERFTEST_SEND_BW},
     {"atomic_bw", PERFTEST_ATOMIC_BW},
 };
+
+static const perftest_bw_unit_desc_t g_bw_units[PERFTEST_BW_UNIT_NUM] = {
+    [PERFTEST_KIB] = {"KiB", 1024},
+    [PERFTEST_MIB] = {"MiB", 1048576},
+    [PERFTEST_GIB] = {"GiB", 1073741824},
+    [PERFTEST_KB] = {"KB", 1000},
+    [PERFTEST_MB] = {"MB", 1000000},
+    [PERFTEST_GB] = {"GB", 1000000000},
+};
+
+const perftest_bw_unit_desc_t *get_bw_unit_desc(perftest_bw_unit_t bw_unit)
+{
+    if ((unsigned int)bw_unit >= PERFTEST_BW_UNIT_NUM) {
+        return &g_bw_units[PERFTEST_MIB];
+    }
+    return &g_bw_units[bw_unit];
+}
+
+static int parse_bw_unit(const char *name, perftest_bw_unit_t *bw_unit)
+{
+    for (uint32_t i = 0; i < PERFTEST_BW_UNIT_NUM; i++) {
+        if (strcmp(name, g_bw_units[i].name) == 0) {
+            *bw_unit = (perftest_bw_unit_t)i;
+            return 0;
+        }
+    }
+    return -1;
+}
 
 static void command_usage(const char *argv0)
 {
@@ -133,7 +161,7 @@ static void usage(const char *argv0)
         "  -Q, --cq_mod <num>          Generate Cqe only after <--cq_mod> completion.\n"
         "  -r, --jfr_post_list <size>  Post list of receive WQEs of <list size> size.\n"
         "  -R, --jfr_depth <dep>       Size of jfr depth (default 512 for BW, 1 for LAT).\n"
-        "  -s, --size <size>           Size of message to exchange (default 2).\n"
+        "  -s, --size <size>           Size of message to exchange (default 2 for lat, 65536 for bw).\n"
         "  -S, --server <addr>         TCP mode: server ip for bind or connect, default: 127.0.0.1.\n"
         "                              UB mode: server mgmt eid (required for client).\n"
         "  -T, --jfs_depth <dep>       Size of jfs depth (default 128 for BW, 1 for LAT).\n"
@@ -157,7 +185,10 @@ static void usage(const char *argv0)
         "  --jettys_pre_jfr <num>      How many jettys share a jfr, default: jettys.\n"
         "  --seg_pre_jetty             Enable a segment for each Jetty, default: disable.\n"
         "  --enable_imm                Enable immediate data for write or send, default: disable.\n"
-        "  --enable_err_continue       Enable continue running when cr erros, default: disable.\n"
+        "  --enable_err_continue       Enable continue running when CR errors occur, default: disable.\n"
+        "                              Recommend also setting --error_suspend true.\n"
+        "  --error_suspend <true/false> Enable error suspend for jetty or jfs, default: false.\n"
+        "                              Recommend enabling with --enable_err_continue.\n"
         "  --enable_notify             Enable write_with_notify, default: disable.\n"
         "  --enable_user_tp            Enable user tp for UB device, if enable,UVS is not required. default: disable.\n"
         "  --oor_en                    Enable out of order for user_tp, default: disable.\n"
@@ -187,7 +218,8 @@ static void usage(const char *argv0)
         "  --hugepage_size <size>      Page size for allocated memory. Only support 2MB or 1GB currently.\n"
         "  --mgmt_addr <eid>           UB only: local eid string for mgmt channel (required in UB mode).\n"
         "  --enable_sync_stream        Enable synchronized multi-stream transmission. \n"
-        "  --bw_unit <unit>            Set bandwidth display unit: KB, MB, or GB (default: MB).\n"
+        "  --bw_unit <unit>            Set bandwidth display unit: KB, MB, GB, KiB, MiB, or GiB (default: MiB).\n"
+        "                              KB/MB/GB use powers of 1000; KiB/MiB/GiB use powers of 1024.\n"
         "  --va <address>              Allow user to set address for local_buf, (Both decimal and hexadecimal).\n"
         "  --share_jfs                 Create ONLY ONE jfs in multi-play-multi mode bw test.\n"
         "  --min_size                  Set min size in random io size, only for bw mode.\n"
@@ -362,9 +394,8 @@ static void init_cfg(perftest_config_t *cfg)
     cfg->priority = PERFTEST_INVALID_PRIORITY;
     cfg->share_jfr = false;
     cfg->jettys_pre_jfr = 0;
-    cfg->is_rate_limit = false;
+    cfg->bw_unit = PERFTEST_MIB;
     cfg->rate_limit = 0;
-    cfg->bw_unit = PERFTEST_MB;
     cfg->burst_size = 0;
     cfg->rate_units = PERFTEST_RATE_LIMIT_GIGA_BIT;
     cfg->enable_credit = false;
@@ -375,6 +406,7 @@ static void init_cfg(perftest_config_t *cfg)
     cfg->seg_pre_jetty = false;
     cfg->enable_imm = false;
     cfg->enable_err_continue = false;
+    cfg->error_suspend = false;
     cfg->enable_notify = false;
     cfg->enable_user_tp = false;
     cfg->oor_en = false;
@@ -393,6 +425,7 @@ static void init_cfg(perftest_config_t *cfg)
     cfg->tp_aware = false;
     cfg->tp_reuse = false;
     cfg->use_ctp = false;
+    cfg->use_utp = false;
 
     cfg->wait_jfc_timeout = PERFTEST_DEF_WAIT_JFC_TIME;
     cfg->use_huge_page = false;
@@ -480,7 +513,7 @@ void print_cfg(const perftest_config_t *cfg)
                   cfg->mode == PERFTEST_MODE_SEQUENTIAL ? "sequential" : "pipeline");
         LOG_QUIET(" Threads             : %u\n", cfg->threads);
         if (cfg->qps > 0) {
-            LOG_QUIET(" QPS_target          : %lu (threads × qps)\n",
+            LOG_QUIET(" QPS_target          : %lu (threads ? qps)\n",
                       (uint64_t)cfg->threads * cfg->qps);
         }
         if (cfg->sweep) {
@@ -708,6 +741,7 @@ int perftest_parse_args(int argc, char *argv[], perftest_config_t *cfg)
         {"enable_imm",          no_argument,       NULL, PERFTEST_OPT_ENABLE_IMM},
         {"inf_period_ms",       required_argument, NULL, PERFTEST_OPT_INF_PERIOD_MS},
         {"enable_err_continue", no_argument,       NULL, PERFTEST_OPT_ENABLE_ERR_CONTINUE},
+        {"error_suspend",       required_argument, NULL, PERFTEST_OPT_ERROR_SUSPEND},
         {"enable_notify",   no_argument,     NULL, PERFTEST_OPT_ENABLE_NOTIFY},
         {"enable_user_tp",      no_argument,       NULL, PERFTEST_OPT_ENABLE_USER_TP},
         {"oor_en",              no_argument,       NULL, PERFTEST_OPT_OOR_EN},
@@ -993,6 +1027,12 @@ int perftest_parse_args(int argc, char *argv[], perftest_config_t *cfg)
             case PERFTEST_OPT_ENABLE_ERR_CONTINUE:
                 cfg->enable_err_continue = true;
                 break;
+            case PERFTEST_OPT_ERROR_SUSPEND:
+                if (ub_str_to_bool(optarg, &cfg->error_suspend) != 0) {
+                    LOG_ERROR("Invalid parameter(error_suspend).\n");
+                    return -1;
+                }
+                break;
             case PERFTEST_OPT_ENABLE_NOTIFY:
                 cfg->enable_notify = true;
                 break;
@@ -1124,14 +1164,8 @@ int perftest_parse_args(int argc, char *argv[], perftest_config_t *cfg)
                 cfg->enable_sync_stream = true;
                 break;
             case PERFTEST_OPT_SET_BW_UNIT:
-                if (strcmp("KB", optarg) == 0) {
-                    cfg->bw_unit = PERFTEST_KB;
-                } else if (strcmp("GB", optarg) == 0) {
-                    cfg->bw_unit = PERFTEST_GB;
-                } else if (strcmp("MB", optarg) == 0) {
-                    cfg->bw_unit = PERFTEST_MB;
-                } else {
-                    LOG_ERROR(" Invalid BW type. Please use KB, MB or GB\n");
+                if (parse_bw_unit(optarg, &cfg->bw_unit) != 0) {
+                    LOG_ERROR(" Invalid BW type. Please use KB, MB, GB, KiB, MiB or GiB\n");
                     return -1;
                 }
                 break;
@@ -1615,6 +1649,11 @@ int check_local_cfg(perftest_config_t *cfg)
             LOG_ERROR("Credit DOES NOT take effect in UM trans_mode.\n");
             exit(1);
         }
+        if (cfg->enable_bond_mode && cfg->bond_mode != BONDP_BONDING_MODE_STANDALONE) {
+            LOG_ERROR("Warning: SEND with enable_credit on a bonding device in active-backup or "
+                      "load-balancing mode (current mode: %s) may exhaust credits and stall traffic.\n",
+                      g_bond_mode_str[cfg->bond_mode]);
+        }
     }
 
     if (cfg->enable_imm == true) {
@@ -1675,10 +1714,15 @@ int check_local_cfg(perftest_config_t *cfg)
     if (cfg->trans_mode == URMA_TM_UM && cfg->use_ctp) {
         LOG_ERROR("UM transport mode is not recommended for ctp.\n");
     }
+    if (cfg->use_ctp) {
+        cfg->use_utp = false;
+    } else if (cfg->trans_mode == URMA_TM_UM) {
+        cfg->use_utp = true;
+    }
     if (cfg->api_type == PERFTEST_SEND) {
-        if (!cfg->use_ctp && cfg->size > PERFTEST_RTP_MAX_SEND_SIZE && !cfg->all) {
-            LOG_ERROR("Invalid size: %u with rtp for send opcode, max size: %u.\n",
-                      cfg->size, PERFTEST_RTP_MAX_SEND_SIZE);
+        if (!cfg->use_ctp && cfg->size > PERFTEST_TP_MAX_SEND_SIZE && !cfg->all) {
+            LOG_ERROR("Invalid size: %u with tp for send opcode, max size: %u.\n",
+                      cfg->size, PERFTEST_TP_MAX_SEND_SIZE);
             exit(1);
         }
         if (cfg->use_ctp && cfg->size > PERFTEST_CTP_MAX_SEND_SIZE && !cfg->all) {
@@ -1686,9 +1730,9 @@ int check_local_cfg(perftest_config_t *cfg)
                       cfg->size, PERFTEST_CTP_MAX_SEND_SIZE);
             exit(1);
         }
-        if (!cfg->use_ctp && cfg->order > PERFTEST_RTP_MAX_ORDER) {
+        if (!cfg->use_ctp && cfg->order > PERFTEST_TP_MAX_ORDER) {
             LOG_ERROR("Invalid order: %u with for send opcode, max order: %u.\n",
-                      cfg->order, PERFTEST_RTP_MAX_ORDER);
+                      cfg->order, PERFTEST_TP_MAX_ORDER);
             exit(1);
         }
         if (cfg->use_ctp && cfg->order > PERFTEST_CTP_MAX_ORDER) {
@@ -1723,6 +1767,12 @@ int check_local_cfg(perftest_config_t *cfg)
                 LOG_ERROR("max_size must more than min_size\n");
                 exit(1);
             }
+        }
+        if (cfg->all == true) {
+            LOG_ERROR("--all (size scan) and random IO size (--min_size/--max_size) are mutually "
+                      "exclusive: they give conflicting answers for the message length. "
+                      "Use --all to scan 2..2^order, or --min_size/--max_size for random lengths.\n");
+            exit(1);
         }
     }
 
@@ -1760,23 +1810,11 @@ int check_local_cfg(perftest_config_t *cfg)
         exit(1);
     }
 
-    /* --infinite not supported with sequential mode */
-    if (cfg->time_type.bs.infinite == 1 && cfg->mode == PERFTEST_MODE_SEQUENTIAL) {
-        LOG_ERROR("--infinite is not supported with --mode sequential.\n");
-        exit(1);
-    }
-
     /* --bidirection not supported with sequential, multi-thread, or pipeline latency collection */
     if (cfg->bidirection && (cfg->mode == PERFTEST_MODE_SEQUENTIAL || cfg->threads > 1 ||
         (cfg->mode == PERFTEST_MODE_PIPELINE && cfg->bw_only == false))) {
         LOG_ERROR("--bidirection is not supported with --mode sequential, --threads > 1, "
                   "or pipeline latency collection.\n");
-        exit(1);
-    }
-
-    /* --all not supported with sequential mode */
-    if (cfg->all && cfg->mode == PERFTEST_MODE_SEQUENTIAL) {
-        LOG_ERROR("--all is not supported with --mode sequential. Use pipeline mode for size scan.\n");
         exit(1);
     }
 
@@ -1802,14 +1840,21 @@ int check_local_cfg(perftest_config_t *cfg)
         exit(1);
     }
 
-    /* --infinite + --threads not supported */
-    if (cfg->time_type.bs.infinite == 1 && cfg->threads > 1) {
-        LOG_ERROR("--infinite is not supported with --threads > 1.\n");
+    /* --infinite + --threads: pipeline engine is single-threaded only; sequential
+       workers are symmetric and support multi-thread infinite runs. */
+    if (cfg->time_type.bs.infinite == 1 && cfg->threads > 1 &&
+        cfg->mode == PERFTEST_MODE_PIPELINE) {
+        LOG_ERROR("--infinite is not supported with --threads > 1 in pipeline mode.\n");
         exit(1);
     }
 
     /* sweep validation */
     if (cfg->sweep) {
+        if (cfg->time_type.bs.infinite == 1) {
+            LOG_ERROR("--sweep is not supported with --infinite (-y): sweep steps are "
+                      "time-windowed while infinite is unbounded.\n");
+            exit(1);
+        }
         /* Sweep has its own time control via time_limit_cycles.
            Clear time_type to avoid conflict with default iterations mode. */
         cfg->time_type.value = 0;

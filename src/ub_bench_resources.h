@@ -151,6 +151,7 @@ typedef struct perftest_context {
     urma_target_seg_t **credit_seg;
     urma_token_id_t **credit_token_id;
     urma_seg_t *remote_credit_seg;
+    urma_seg_t **remote_credit_seg_duplex; // delegated seg ctx, bonding duplex only
     urma_target_seg_t **import_credit_seg;
 
     // write notify
@@ -158,6 +159,7 @@ typedef struct perftest_context {
     urma_target_seg_t *notify_seg;
     urma_token_id_t *notify_token_id;
     urma_seg_t *remote_notify_seg;
+    urma_seg_t **remote_notify_seg_duplex; // delegated seg ctx, bonding duplex only
     uint32_t remote_jetty_idx;
     urma_target_seg_t **import_notify_seg; // be processed for different remote seg
 
@@ -188,7 +190,18 @@ typedef struct {
     latency_hist_t hist;
     uint64_t time_limit_cycles; // sweep: 0 = no limit
     uint64_t total_count;       // per-thread packet count (independent of histogram)
+    uint64_t err_count;         // per-thread CR error count (error_suspend isolation)
     double cpu_mhz;            // CPU frequency, computed once by main thread
+    /* infinite (-y) snapshot handoff: print thread requests, worker copies its
+     * histogram between packets; single writer (worker) + single reader (print). */
+    latency_hist_t snap;        // staging copy for periodic reporting
+    int snap_request;           // set by print thread (release), cleared by worker
+    int snap_ready;             // set by worker (release), cleared by print thread
+    /* Exact per-interval extremes: running since the last snapshot service,
+     * saved into snap.min_delta/max_delta and reset at each service point.
+     * hist.min_delta/max_delta stay whole-run cumulative for the final report. */
+    uint64_t interval_min;
+    uint64_t interval_max;
 } bench_thread_arg_t;
 
 /* calculate sge addr offset and step forward. */

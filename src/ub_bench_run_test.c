@@ -92,33 +92,10 @@ void catch_alarm(int sig)
     }
 }
 
-static double get_bw_unit_ratio(perftest_bw_unit_t bw_unit)
-{
-    switch (bw_unit) {
-        case PERFTEST_KB:
-            return PERFTEST_BW_KB;
-        case PERFTEST_GB:
-            return PERFTEST_BW_GB;
-        case PERFTEST_MB:
-        default:
-            return PERFTEST_BW_MB;
-    }
-}
-
 void print_bw_header(const perftest_config_t *cfg)
 {
-    switch (cfg->bw_unit) {
-        case PERFTEST_KB:
-            LOG_QUIET(RESULT_BW_UNIT_FMT, "KiB", "KiB");
-            break;
-        case PERFTEST_GB:
-            LOG_QUIET(RESULT_BW_UNIT_FMT, "GiB", "GiB");
-            break;
-        case PERFTEST_MB:
-        default:
-            LOG_QUIET(RESULT_BW_UNIT_FMT, "MiB", "MiB");
-            break;
-    }
+    const perftest_bw_unit_desc_t *desc = get_bw_unit_desc(cfg->bw_unit);
+    LOG_QUIET(RESULT_BW_UNIT_FMT, desc->name, desc->name);
 }
 
 static void request_exit(void)
@@ -132,7 +109,7 @@ static void catch_sigint(int sig)
     request_exit();
 }
 
-static void notify_peer_exit(void)
+void notify_peer_exit(void)
 {
     if (g_perftest_cfg != NULL) {
         char cmd = PERFTEST_EXIT_CMD;
@@ -231,6 +208,14 @@ uint64_t get_remote_seg_va(const perftest_context_t *ctx, const perftest_config_
         return ctx->remote_seg_duplex[i]->ubva.va;
     }
     return ctx->remote_seg[i].ubva.va;
+}
+
+static inline uint64_t get_remote_credit_seg_va(const perftest_context_t *ctx, uint32_t i)
+{
+    if (ctx->remote_credit_seg_duplex != NULL) {
+        return ctx->remote_credit_seg_duplex[i]->ubva.va;
+    }
+    return ctx->remote_credit_seg[i].ubva.va;
 }
 
 static int poll_jfc_until_expected_cqe(perftest_context_t *ctx, perftest_config_t *cfg, uint32_t id, urma_cr_t *cr)
@@ -1093,7 +1078,7 @@ static void init_credit_wr(perftest_context_t *ctx, perftest_config_t *cfg)
         run_ctx->credit_sge[i].len = sizeof(uint64_t);
         run_ctx->credit_sge[i].tseg = ctx->credit_seg[i];
 
-        run_ctx->remote_credit_sge[i].addr = (uint64_t)(ctx->remote_credit_seg[i].ubva.va + sizeof(uint64_t));
+        run_ctx->remote_credit_sge[i].addr = get_remote_credit_seg_va(ctx, i) + sizeof(uint64_t);
         run_ctx->remote_credit_sge[i].len = sizeof(uint64_t);
         run_ctx->remote_credit_sge[i].tseg = ctx->import_credit_seg[i];
 
@@ -1192,11 +1177,13 @@ free_wr:
     return -1;
 }
 
-static inline void destroy_jfs_wr(perftest_context_t *ctx)
+void destroy_jfs_wr(perftest_context_t *ctx)
 {
     run_test_ctx_t *run_ctx = &ctx->run_ctx;
     free(run_ctx->jfs_sge);
+    run_ctx->jfs_sge = NULL;
     free(run_ctx->jfs_wr);
+    run_ctx->jfs_wr = NULL;
 }
 
 static void init_jfr_wr(urma_jfr_wr_t *wr, perftest_context_t *ctx, perftest_config_t *cfg,
@@ -1256,12 +1243,15 @@ free_jfr_wr:
     return -1;
 }
 
-static inline void destroy_jfr_wr(perftest_context_t *ctx)
+void destroy_jfr_wr(perftest_context_t *ctx)
 {
     run_test_ctx_t *run_ctx = &ctx->run_ctx;
     free(run_ctx->rx_buf_addr);
+    run_ctx->rx_buf_addr = NULL;
     free(run_ctx->jfr_sge);
+    run_ctx->jfr_sge = NULL;
     free(run_ctx->jfr_wr);
+    run_ctx->jfr_wr = NULL;
 }
 
 int prepare_jfr_wr(perftest_context_t *ctx, perftest_config_t *cfg)
@@ -1994,7 +1984,8 @@ static int run_once_bw(perftest_context_t *ctx, perftest_config_t *cfg)
                         if (cfg->enable_err_continue == false) {
                             goto free_cr;
                         } else {
-                            tot_scnt = tot_scnt - (cqe_cnt - i) * cfg->cq_mod;
+                            tot_scnt -= cfg->cq_mod;
+                            run_ctx->scnt[cr_id] -= cfg->cq_mod;
                             continue;
                         }
                     }
@@ -2131,18 +2122,29 @@ static void *run_once_bw_thread(void *arg)
             if (cqe_cnt > 0) {
                 for (int i = 0; i < cqe_cnt; i++) {
                     if (cr[i].status != URMA_CR_SUCCESS) {
-                        if (__sync_bool_compare_and_swap(&run_ctx->abort, 0, 1)) {
-                            LOG_ERROR("CR error: %s (status %d), thread %u.\n",
-                                      cr_status_str((int)cr[i].status), (int)cr[i].status, id);
-                            if (cr[i].status == URMA_CR_ACK_TIMEOUT_ERR) {
-                                LOG_ERROR("Hint: try reducing --threads or -s.\n");
-                            } else if (cr[i].status == URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
-                                LOG_ERROR("Hint: receiver buffer exhausted, try increasing -R or reducing --threads.\n");
+                        if (cfg->error_suspend == false) {
+                            if (__sync_bool_compare_and_swap(&run_ctx->abort, 0, 1)) {
+                                LOG_ERROR("CR error: %s (status %d), thread %u.\n",
+                                          cr_status_str((int)cr[i].status), (int)cr[i].status, id);
+                                if (cr[i].status == URMA_CR_ACK_TIMEOUT_ERR) {
+                                    LOG_ERROR("Hint: try reducing --threads or -s.\n");
+                                } else if (cr[i].status == URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
+                                    LOG_ERROR("Hint: receiver buffer exhausted, try increasing -R or reducing --threads.\n");
+                                }
                             }
+                            free(cr);
+                            t->end_time = get_cycles();
+                            return (void *)(intptr_t)(-1);
                         }
+                        /* error_suspend: the JFS is suspended by HW; this thread
+                         * cannot drain in-flight WRs, but each thread owns an
+                         * independent JFS/JFC, so isolate instead of aborting. */
+                        LOG_ERROR("CR error: %s (status %d), thread %u isolated (error_suspend).\n",
+                                  cr_status_str((int)cr[i].status), (int)cr[i].status, id);
+                        t->err_count++;
                         free(cr);
                         t->end_time = get_cycles();
-                        return (void *)(intptr_t)(-1);
+                        return NULL;
                     }
                     ccnt += cfg->cq_mod;
                     if (collecting) {
@@ -2221,10 +2223,14 @@ static int run_once_bw_mt(perftest_context_t *ctx, perftest_config_t *cfg)
 
     void *thread_ret;
     int worker_err = 0;
+    uint32_t err_threads = 0;
     for (i = 0; i < cfg->threads; i++) {
         pthread_join(args[i].tid, &thread_ret);
         if (thread_ret != NULL) {
             worker_err = -1;
+        }
+        if (args[i].err_count > 0) {
+            err_threads++;
         }
     }
 
@@ -2236,6 +2242,9 @@ static int run_once_bw_mt(perftest_context_t *ctx, perftest_config_t *cfg)
         ctx->run_ctx.abort = 1;
         free(args);
         return -1;
+    }
+    if (err_threads > 0) {
+        LOG_QUIET(" Error threads       : %u/%u isolated (error_suspend)\n", err_threads, cfg->threads);
     }
 
     latency_hist_t global_hist;
@@ -2262,11 +2271,9 @@ static int run_once_bw_mt(perftest_context_t *ctx, perftest_config_t *cfg)
         global_end = run_ctx->tcompleted[0];
     }
 
-    double unit_ratio = (cfg->bw_unit == PERFTEST_MB) ? (double)PERFTEST_BW_MB :
-                        (cfg->bw_unit == PERFTEST_KB) ? (double)PERFTEST_BW_KB :
-                        (double)PERFTEST_BW_GB;
-    const char *unit_str = (cfg->bw_unit == PERFTEST_MB) ? "MiB" :
-                           (cfg->bw_unit == PERFTEST_KB) ? "KiB" : "GiB";
+    const perftest_bw_unit_desc_t *unit_desc = get_bw_unit_desc(cfg->bw_unit);
+    double unit_ratio = (double)unit_desc->bytes_per_unit;
+    const char *unit_str = unit_desc->name;
     double bw_avg = ((double)cfg->size * total_count * cpu_mhz * PERFTEST_M) /
                     ((double)(global_end - global_start) * unit_ratio);
     double actual_qps = (double)total_count * cpu_mhz * PERFTEST_M /
@@ -2873,11 +2880,22 @@ static int run_once_bi_bw(perftest_context_t *ctx, perftest_config_t *cfg)
                 if (cr_send[i].status != URMA_CR_SUCCESS) {
                     LOG_ERROR("Failed cr_send, status: %d, i: %d, tot_ccnt: %lu\n.",
                               (int)cr_send[i].status, i, tot_ccnt);
+                    if (is_credit_send == true) {
+                        /* The credit write failed and its credit update is
+                         * lost, the credit flow cannot recover: reclaim the
+                         * in-flight counters (otherwise clean_scq_credit would
+                         * wait forever for this consumed CQE) and abort. */
+                        scredit_pre_jetty[cr_id]--;
+                        tot_scredit--;
+                        ret = -1;
+                        goto cleaning;
+                    }
                     if (cfg->enable_err_continue == false) {
                         ret = -1;
                         goto cleaning;
                     } else {
-                        tot_scnt = tot_scnt - (send_cqe_cnt - i) * cfg->cq_mod;
+                        tot_scnt -= cfg->cq_mod;
+                        run_ctx->scnt[cr_id] -= cfg->cq_mod;
                         continue;
                     }
                 }
@@ -2997,7 +3015,7 @@ static void print_bw_report(perftest_context_t *ctx, perftest_config_t *cfg,
     /* Exception iters equals last_iters, causing iters_sum to be 0 */
     uint64_t run_ctx_iters_sum = iters_sum == 0 ? 0 : iters_sum - 1;
     cycles_sum = (double)(run_ctx->tcompleted[cfg->no_peak == true ? 0 : run_ctx_iters_sum] - tposted_0);
-    unit_ratio = get_bw_unit_ratio(cfg->bw_unit);
+    unit_ratio = get_bw_unit_desc(cfg->bw_unit)->bytes_per_unit;
     bw_avg = ((double)size * iters_sum * cycles_to_units) / (cycles_sum * unit_ratio);
     double msg_rate_avg = ((double)iters_sum * cycles_to_units * inf_bi_factor) / (cycles_sum * PERFTEST_M);
 
@@ -3050,7 +3068,7 @@ static void print_bw_report_per_jetty(perftest_context_t *ctx, perftest_config_t
                         ? (cfg->api_type == PERFTEST_SEND ? INF_BI_FACTOR_SEND : INF_BI_FACTOR_OTHER)
                         : NON_INF_BI_FACTOR;
     size = inf_bi_factor * cfg->size;
-    unit_ratio = get_bw_unit_ratio(cfg->bw_unit);
+    unit_ratio = get_bw_unit_desc(cfg->bw_unit)->bytes_per_unit;
 
     uint64_t tot_iters = num_of_cal_iters * jettys_count;
     uint64_t tcompleted_last = run_ctx->tcompleted[cfg->no_peak == true ? 0 : tot_iters - 1];
@@ -3094,7 +3112,7 @@ void print_bi_bw_report(const bw_report_data_t *local_bw_report,
     uint64_t iters = (local_bw_report->iters > remote_bw_report->iters)
                          ? local_bw_report->iters
                          : remote_bw_report->iters;
-    double unit_ratio = get_bw_unit_ratio(cfg->bw_unit);
+    double unit_ratio = get_bw_unit_desc(cfg->bw_unit)->bytes_per_unit;
     double bw_peak = (local_bw_report->bw_peak + remote_bw_report->bw_peak) / unit_ratio;
     double bw_avg = (local_bw_report->bw_avg + remote_bw_report->bw_avg) / unit_ratio;
     double msg_rate_avg = local_bw_report->msg_rate_avg + remote_bw_report->msg_rate_avg;
@@ -3285,7 +3303,10 @@ static int run_once_bw_infinite(perftest_context_t *ctx, perftest_config_t *cfg)
                         if (cfg->enable_err_continue == false) {
                             goto err_exit;
                         } else {
-                            tot_scnt = tot_scnt - (cqe_cnt - i) * cfg->cq_mod;
+                            /* user_ctx carries the jetty id here. */
+                            cr_id = (int)cr[i].user_ctx;
+                            tot_scnt -= cfg->cq_mod;
+                            run_ctx->scnt[cr_id] -= cfg->cq_mod;
                             continue;
                         }
                     }

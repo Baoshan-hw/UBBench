@@ -95,9 +95,6 @@
 #define PERFTEST_G         (1000000000)
 #define PERFTEST_MBS       (0x100000)
 #define PERFTEST_KPPS      (1000)
-#define PERFTEST_BW_KB     0x400      // 2^10
-#define PERFTEST_BW_MB     0x100000   // 2^20
-#define PERFTEST_BW_GB     0x40000000 // 2^30
 #define PERFTEST_BYTE_SIZE 8
 #define PERFTEST_SGE_NUM_PRE_WR  (2)
 #define PERFTEST_POLL_BATCH      (16)
@@ -181,6 +178,7 @@ enum perftest_opts {
     PERFTEST_OPT_ENABLE_IMM,
     PERFTEST_OPT_INF_PERIOD_MS,
     PERFTEST_OPT_ENABLE_ERR_CONTINUE,
+    PERFTEST_OPT_ERROR_SUSPEND,
     PERFTEST_OPT_ENABLE_NOTIFY,
     PERFTEST_OPT_ENABLE_USER_TP,
     PERFTEST_OPT_OOR_EN,
@@ -232,10 +230,19 @@ typedef enum perftest_rate_limiter_units {
 } perftest_rate_limiter_unit_t;
 
 typedef enum perftest_bw_unit {
+    PERFTEST_KIB,
+    PERFTEST_MIB,
+    PERFTEST_GIB,
     PERFTEST_KB,
     PERFTEST_MB,
     PERFTEST_GB,
+    PERFTEST_BW_UNIT_NUM
 } perftest_bw_unit_t;
+
+typedef struct perftest_bw_unit_desc {
+    const char *name;
+    uint64_t bytes_per_unit;
+} perftest_bw_unit_desc_t;
 
 typedef union perftest_net_addr {
     uint8_t raw[URMA_IP_ADDR_BYTES]; /* Network Order */
@@ -325,6 +332,7 @@ typedef struct perftest_config {
     bool enable_imm;
     bool enable_notify;
     bool enable_err_continue;
+    bool error_suspend;
 
     /* user tp */
     bool enable_user_tp;
@@ -349,6 +357,7 @@ typedef struct perftest_config {
     bool tp_aware;
     bool tp_reuse;
     bool use_ctp;
+    bool use_utp; /* derived: trans_mode == URMA_TM_UM && !use_ctp */
     uint32_t jetty_id;
     int32_t wait_jfc_timeout;
     urma_huge_page_size_t huge_page;
@@ -408,6 +417,7 @@ static inline bool perftest_check_rs_mode(const perftest_config_t *cfg)
     return cfg->trans_mode == URMA_TM_RC && ((cfg->order_type & URMA_OT) != 0);
 };
 
+const perftest_bw_unit_desc_t *get_bw_unit_desc(perftest_bw_unit_t bw_unit);
 void print_cfg(const perftest_config_t *cfg);
 int perftest_parse_args(int argc, char *argv[], perftest_config_t *cfg);
 void destroy_cfg(perftest_config_t *cfg);

@@ -112,7 +112,7 @@ sequential 模式逐包采集 WR 完成时延（`tcompleted - tposted`），写�
 | `--qps` | 支持 | 不支持 |
 | `--sweep` | 支持 | 不支持 |
 | `--bw-only` | 可关闭时延采集 | 可关闭时延采集 |
-| `-y`（infinite） | 不支持 | 支持 |
+| `-y（infinite） | 支持（含多线程） | 支持（仅单线程） |
 | 等价 urma_perftest | 否 | `--mode pipeline --bw-only` 等价 |
 
 ## 命令
@@ -156,6 +156,7 @@ Options (ub_bench extensions):
 | `--sweep` | string | — | QPS 扫描 `start:end:step`，仅 sequential 模式 |
 | `--sweep-duration` | uint32 | 10 | 每步扫描持续时间（秒）。每步按固定时长运行（由 `time_limit_cycles` 控制，非迭代数）；总扫描点数 = `(end-start)/step + 1` |
 | `--bw-only` | flag | false | 跳过时延采集，纯带宽测试 |
+| `--error_suspend` | bool | false | 开启 JFS 错误挂起；多线程 BW 下单线程 CR 错误时隔离该线程而不全局中止，报告 Error threads 列明被隔离的线程数 |
 
 ### 原有参数
 
@@ -194,7 +195,7 @@ Options:
   -Q, --cq_mod <num>          Generate Cqe only after <--cq_mod> completion.
   -r, --jfr_post_list <size>  Post list of receive WQEs of <list size> size.
   -R, --jfr_depth <dep>       Size of jfr depth (default 512 for BW, 1 for LAT).
-  -s, --size <size>           Size of message to exchange (default 2).
+  -s, --size <size>           Size of message to exchange (default 2 for lat, 65536 for bw).
   -S, --server <addr>         TCP mode: server ip for bind or connect, default: 127.0.0.1.
                               UB mode: server mgmt eid (required for client).
   -T, --jfs_depth <dep>       Size of jfs depth (default 128 for BW, 1 for LAT).
@@ -218,11 +219,11 @@ Options:
   --jettys_pre_jfr <num>      How many jettys share a jfr, default: jettys.
   --seg_pre_jetty             Enable a segment for each Jetty, default: disable.
   --enable_imm                Enable immediate data for write or send, default: disable.
-  --enable_err_continue       Enable continue running when cr erros, default: disable.
-  --enable_notify            Enable write_with_notify, default: disable.
-  --enable_sync_stream        Enable synchronized multi-stream transmission.
-  --enable_user_tp            Enable user tp for UB device, if enable,UVS is not required. default: disable.
-  --oor_en                    Enable out of order for user_tp, default: disable.
+  --enable_err_continue       Enable continue running when CR errors occur, default: disable.
+                              Recommend also setting --error_suspend true.
+  --error_suspend <true/false> Enable error suspend for jetty or jfs, default: false.
+                              Recommend enabling with --enable_err_continue. In multi-thread
+                              BW runs a failed thread is isolated instead of aborting all.
   --spray_en                  Enable multipathing for user_tp, default: disable.
   --cc_en                     Enable congestion control for user_tp, default: disable.
   --cc_alg <num>              Set congestion Control Algorithm for user_tp, [0, 7], default: 0.
@@ -251,8 +252,8 @@ Options:
   --bond_mode                 Set bonding device mode, support: standalone, active_backup, balance.
                               default: standalone.
   --bond_level                Set bonding device level, support: iodie, port, default: iodie.
-  --bw_unit <unit>            Set bandwidth display unit: KB, MB, or GB (default: MB).
-  --va <address>              Allow user to set address for local_buf, (Both decimal and hexadecimal).
+  --bw_unit <unit>            Set bandwidth display unit: KB, MB, GB, KiB, MiB, or GiB (default: MiB).
+                              KB/MB/GB use powers of 1000; KiB/MiB/GiB use powers of 1024.
   --share_jfs                 Create ONLY ONE jfs in multi-play-multi mode bw test.
   --min_size                  Set min size in random io size, only for bw mode.
   --max_size                  Set max size in random io size, only for bw mode.
@@ -281,8 +282,8 @@ Options:
 1. `--mode pipeline` 仅用于 BW 测试；
 2. `--qps` 仅用于 BW sequential 模式，与 `--sweep`、`--rate_limit` 互斥；
 3. `--sweep` 仅用于 BW sequential 模式，不支持 send_bw（服务端收包为计数驱动，无法匹配时间驱动的 sweep 步长）和 bidirection；
-4. `--mode sequential` 不支持 `--infinite`(-y)、`--bidirection`(-B)、`--all`(-a)；
-5. `--threads > 1` 仅用于 BW 测试，不支持 `--infinite`(-y)；
+4. `--mode sequential` 不支持 `--bidirection`(-B)；`--all`(-a) 与 `--infinite`(-y) 两种模式均支持（多线程 `-y` 仅 sequential）。
+5. `--threads > 1` 仅限 BW 测试； pipeline 模式下不支持 `--infinite`(-y)， sequential 支持（多线程 -y 仅 sequential）。
 6. `--bidirection`(-B) 不支持 sequential 模式、多线程、pipeline + 非 bw_only；
 7. `--bw-only` 仅用于 BW 测试；
 8. sequential 模式强制 `jfs_depth=1`、`cq_mod=1`、`jfr_post_list=1`（用户配置的 -T、-Q、-r 被覆盖）；同时自动设 `no_peak=false`（非 bw_only 且非 duration 模式时）；

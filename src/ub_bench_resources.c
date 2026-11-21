@@ -135,18 +135,25 @@ static int check_dev_cap(perftest_context_t *ctx, perftest_config_t *cfg)
     return 0;
 }
 
+/* priority_info[].tp_type is a combined bitmap; match by bit-and instead of
+ * exact equality, with bounds check. */
+static inline bool priority_supports_tp(urma_device_attr_t *attr, uint8_t p, union urma_tp_type_en tp_type)
+{
+    if (p > URMA_MAX_PRIORITY) {
+        return false;
+    }
+    return (attr->dev_cap.priority_info[p].tp_type.value & tp_type.value) != 0;
+}
+
 static int get_jetty_priority_by_tp_type(urma_device_attr_t *dev_attr, union urma_tp_type_en tp_type)
 {
-    int pri = -1;
-
     for (int i = 0; i <= URMA_MAX_PRIORITY; i++) {
-        if (tp_type.value == dev_attr->dev_cap.priority_info[i].tp_type.value) {
-            pri = i;
-            return pri;
+        if ((dev_attr->dev_cap.priority_info[i].tp_type.value & tp_type.value) != 0) {
+            return i;
         }
     }
-    LOG_ERROR("Failed to get sl resources");
-    return -1;
+    LOG_ERROR("Failed to get sl resources for tp_type=0x%x\n", tp_type.value);
+    return PERFTEST_INVALID_PRIORITY;
 }
 
 static int init_device(perftest_context_t *ctx, perftest_config_t *cfg)
@@ -196,17 +203,27 @@ static int init_device(perftest_context_t *ctx, perftest_config_t *cfg)
 
     union urma_tp_type_en tp_type = {0};
     if (cfg->priority == PERFTEST_INVALID_PRIORITY) {
-        if (ctx->urma_ctx->ops->import_jetty_ex == NULL) {
+        if (ctx->urma_ctx->ops->import_jetty_ex == NULL &&
+            !perftest_is_bonding_dev(ctx->urma_ctx->dev->name)) {
             cfg->priority = 0;
         } else if (cfg->use_ctp) {
             tp_type.bs.ctp = 1;
+            cfg->priority = (uint8_t)get_jetty_priority_by_tp_type(&ctx->dev_attr, tp_type);
+        } else if (cfg->use_utp) {
+            tp_type.bs.utp = 1;
             cfg->priority = (uint8_t)get_jetty_priority_by_tp_type(&ctx->dev_attr, tp_type);
         } else {
             tp_type.bs.rtp = 1;
             cfg->priority = (uint8_t)get_jetty_priority_by_tp_type(&ctx->dev_attr, tp_type);
         }
+        if (cfg->priority > URMA_MAX_PRIORITY) {
+            LOG_ERROR("The priority parameter %hhu is invalid; it should be 0-15.\n",
+                      cfg->priority);
+            goto del_ctx;
+        }
         LOG_ERROR("Warning: %s should set priority to %hhu.\n",
-                  (cfg->use_ctp == true ? "ctp" : "rtp"), cfg->priority);
+                  (cfg->use_ctp == true ? "ctp" : (cfg->use_utp == true ? "utp" : "rtp")),
+                  cfg->priority);
     } else {
         if (cfg->priority > URMA_MAX_PRIORITY) {
             LOG_ERROR("The priority parameter %hhu is invalid; it should be 0-15.\n",
@@ -214,22 +231,28 @@ static int init_device(perftest_context_t *ctx, perftest_config_t *cfg)
         }
         if (cfg->use_ctp && ctx->urma_ctx->ops->import_jetty_ex != NULL) {
             tp_type.bs.ctp = 1;
-            if (tp_type.value != ctx->dev_attr.dev_cap.priority_info[cfg->priority].tp_type.value) {
-                LOG_ERROR("You should set the priority of type CTP\n");
-                goto uninit;
+            if (!priority_supports_tp(&ctx->dev_attr, cfg->priority, tp_type)) {
+                LOG_ERROR("Priority %hhu does not support CTP\n", cfg->priority);
+                goto del_ctx;
+            }
+        } else if (cfg->use_utp && ctx->urma_ctx->ops->import_jetty_ex != NULL) {
+            tp_type.bs.utp = 1;
+            if (!priority_supports_tp(&ctx->dev_attr, cfg->priority, tp_type)) {
+                LOG_ERROR("Priority %hhu does not support UTP\n", cfg->priority);
+                goto del_ctx;
             }
         } else if (ctx->urma_ctx->ops->import_jetty_ex != NULL) {
             tp_type.bs.rtp = 1;
-            if (tp_type.value != ctx->dev_attr.dev_cap.priority_info[cfg->priority].tp_type.value) {
-                LOG_ERROR("You should set the priority of type RTP\n");
-                goto uninit;
+            if (!priority_supports_tp(&ctx->dev_attr, cfg->priority, tp_type)) {
+                LOG_ERROR("Priority %hhu does not support RTP\n", cfg->priority);
+                goto del_ctx;
             }
         }
     }
 
     if (cfg->enable_user_tp == true) {
         LOG_ERROR("The UB device does not support user_tp!\n");
-        goto uninit;
+        goto del_ctx;
     }
 
     ctx->eid = ctx->urma_ctx->eid;
@@ -464,6 +487,7 @@ static int create_jfs(perftest_context_t *ctx, const perftest_config_t *cfg)
     urma_jfs_cfg_t jfs_cfg = {
         .depth = cfg->jfs_depth,
         .flag.bs.lock_free = cfg->lock_free ? 1 : 0,
+        .flag.bs.error_suspend = cfg->error_suspend ? 1 : 0,
         .trans_mode = cfg->trans_mode,
         .priority = cfg->priority, /* Highest priority */
         .max_sge = 1,
@@ -553,6 +577,7 @@ static void fill_jfs_cfg(perftest_context_t *ctx, const perftest_config_t *cfg, 
     jfs_cfg->depth = cfg->jfs_depth;
     jfs_cfg->flag.value = 0;
     jfs_cfg->flag.bs.lock_free = cfg->lock_free ? 1 : 0;
+    jfs_cfg->flag.bs.error_suspend = cfg->error_suspend ? 1 : 0;
     jfs_cfg->trans_mode = cfg->trans_mode;
     jfs_cfg->priority = cfg->priority; /* Highest priority */
     jfs_cfg->max_sge = 1;
@@ -1283,6 +1308,19 @@ static void free_remote_credit(perftest_context_t *ctx)
     ctx->remote_credit_seg = NULL;
 }
 
+static void free_remote_credit_duplex(perftest_context_t *ctx, const perftest_config_t *cfg)
+{
+    if (ctx->remote_credit_seg_duplex == NULL) {
+        return;
+    }
+    uint32_t put_num = (cfg->pair_flag) ? cfg->pair_num : ctx->jetty_num;
+    for (uint32_t i = 0; i < put_num; i++) {
+        urma_put_seg_ctx(ctx->remote_credit_seg_duplex[i]);
+    }
+    free(ctx->remote_credit_seg_duplex);
+    ctx->remote_credit_seg_duplex = NULL;
+}
+
 static int exchange_credit_info(perftest_context_t *ctx, perftest_config_t *cfg)
 {
     if (!cfg->enable_credit) {
@@ -1334,6 +1372,19 @@ static void free_remote_notify(perftest_context_t *ctx)
     ctx->remote_notify_seg = NULL;
 }
 
+static void free_remote_notify_duplex(perftest_context_t *ctx, const perftest_config_t *cfg)
+{
+    if (ctx->remote_notify_seg_duplex == NULL) {
+        return;
+    }
+    uint32_t put_num = (cfg->pair_flag) ? cfg->pair_num : ctx->jetty_num;
+    for (uint32_t i = 0; i < put_num; i++) {
+        urma_put_seg_ctx(ctx->remote_notify_seg_duplex[i]);
+    }
+    free(ctx->remote_notify_seg_duplex);
+    ctx->remote_notify_seg_duplex = NULL;
+}
+
 static int exchange_notify_info(perftest_context_t *ctx, perftest_config_t *cfg)
 {
     if (!cfg->enable_notify) {
@@ -1378,6 +1429,141 @@ static int exchange_notify_info(perftest_context_t *ctx, perftest_config_t *cfg)
 free_buf:
     free(local_seg_buf);
     free(remote_seg_buf);
+    return -1;
+}
+
+/* Delegated variant: exchange credit seg ctx via urma_get_seg_ctx (bonding duplex only). */
+static int exchange_credit_seg_ctx(perftest_context_t *ctx, perftest_config_t *cfg)
+{
+    if (!cfg->enable_credit) {
+        return 0;
+    }
+
+    uint32_t sync_num = cfg->pair_flag ? cfg->pair_num : ctx->jetty_num;
+    urma_seg_t **local_seg_arr = calloc(ctx->jetty_num, sizeof(urma_seg_t *));
+    uint32_t *local_len_arr = calloc(ctx->jetty_num, sizeof(uint32_t));
+    ctx->remote_credit_seg_duplex = calloc(ctx->jetty_num, sizeof(urma_seg_t *));
+    if (local_seg_arr == NULL || local_len_arr == NULL || ctx->remote_credit_seg_duplex == NULL) {
+        goto free_buf;
+    }
+
+    for (uint32_t i = 0; i < ctx->jetty_num; i++) {
+        if (urma_get_seg_ctx(ctx->credit_seg[i], &local_seg_arr[i], &local_len_arr[i]) != URMA_SUCCESS) {
+            LOG_ERROR("Failed to urma_get_seg_ctx credit %u!\n", i);
+            goto free_buf;
+        }
+    }
+
+    for (uint32_t i = 0; i < sync_num; i++) {
+        char *peer_buf = NULL;
+        uint32_t peer_len = 0;
+        if (sync_var_data(cfg, cfg->pair_flag ? i : 0,
+                          (const char *)local_seg_arr[i], local_len_arr[i],
+                          &peer_buf, &peer_len) != 0) {
+            LOG_ERROR("Failed to exchange credit seg %u!\n", i);
+            goto free_buf;
+        }
+        ctx->remote_credit_seg_duplex[i] = (urma_seg_t *)peer_buf;
+    }
+    if (cfg->pair_flag) {
+        for (uint32_t i = cfg->pair_num; i < ctx->jetty_num; i++) {
+            ctx->remote_credit_seg_duplex[i] = ctx->remote_credit_seg_duplex[i % cfg->pair_num];
+        }
+    }
+
+    for (uint32_t i = 0; i < ctx->jetty_num; i++) {
+        if (local_seg_arr[i] != NULL) {
+            urma_put_seg_ctx(local_seg_arr[i]);
+        }
+    }
+    free(local_seg_arr);
+    free(local_len_arr);
+    return 0;
+
+free_buf:
+    if (local_seg_arr != NULL) {
+        for (uint32_t i = 0; i < ctx->jetty_num; i++) {
+            if (local_seg_arr[i] != NULL) {
+                urma_put_seg_ctx(local_seg_arr[i]);
+            }
+        }
+        free(local_seg_arr);
+    }
+    free(local_len_arr);
+    if (ctx->remote_credit_seg_duplex != NULL) {
+        for (uint32_t i = 0; i < sync_num; i++) {
+            if (ctx->remote_credit_seg_duplex[i] != NULL) {
+                urma_put_seg_ctx(ctx->remote_credit_seg_duplex[i]);
+            }
+        }
+        free(ctx->remote_credit_seg_duplex);
+        ctx->remote_credit_seg_duplex = NULL;
+    }
+    return -1;
+}
+
+/* Delegated variant: exchange notify seg ctx via urma_get_seg_ctx (bonding duplex only). */
+static int exchange_notify_seg_ctx(perftest_context_t *ctx, perftest_config_t *cfg)
+{
+    if (!cfg->enable_notify) {
+        return 0;
+    }
+
+    uint32_t sync_num = cfg->pair_flag ? cfg->pair_num : ctx->jetty_num;
+    urma_seg_t *local_seg = NULL;
+    uint32_t local_len = 0;
+    ctx->remote_notify_seg_duplex = calloc(ctx->jetty_num, sizeof(urma_seg_t *));
+    if (ctx->remote_notify_seg_duplex == NULL) {
+        return -1;
+    }
+
+    if (urma_get_seg_ctx(ctx->notify_seg, &local_seg, &local_len) != URMA_SUCCESS) {
+        LOG_ERROR("Failed to urma_get_seg_ctx notify!\n");
+        goto free_buf;
+    }
+
+    for (uint32_t i = 0; i < sync_num; i++) {
+        char *peer_buf = NULL;
+        uint32_t peer_len = 0;
+        if (sync_var_data(cfg, cfg->pair_flag ? i : 0,
+                          (const char *)local_seg, local_len,
+                          &peer_buf, &peer_len) != 0) {
+            LOG_ERROR("Failed to exchange notify seg %u!\n", i);
+            goto free_buf;
+        }
+        ctx->remote_notify_seg_duplex[i] = (urma_seg_t *)peer_buf;
+        if (cfg->pair_flag) {
+            if (sync_data(cfg, i, sizeof(uint32_t),
+                          (char *)&i, (char *)&ctx->remote_jetty_idx) != 0) {
+                LOG_ERROR("Failed to exchange jetty_idx %u!\n", i);
+                goto free_buf;
+            }
+        }
+    }
+    if (cfg->pair_flag) {
+        for (uint32_t i = cfg->pair_num; i < ctx->jetty_num; i++) {
+            ctx->remote_notify_seg_duplex[i] = ctx->remote_notify_seg_duplex[i % cfg->pair_num];
+        }
+    }
+
+    if (local_seg != NULL) {
+        urma_put_seg_ctx(local_seg);
+    }
+    return 0;
+
+free_buf:
+    if (local_seg != NULL) {
+        urma_put_seg_ctx(local_seg);
+    }
+    if (ctx->remote_notify_seg_duplex != NULL) {
+        for (uint32_t i = 0; i < sync_num; i++) {
+            if (ctx->remote_notify_seg_duplex[i] != NULL) {
+                urma_put_seg_ctx(ctx->remote_notify_seg_duplex[i]);
+            }
+        }
+        free(ctx->remote_notify_seg_duplex);
+        ctx->remote_notify_seg_duplex = NULL;
+    }
     return -1;
 }
 
@@ -1430,7 +1616,7 @@ static int create_tp_info(perftest_context_t *ctx, perftest_config_t *cfg)
     urma_get_tp_cfg_t tp_cfg = {0};
     if (cfg->use_ctp) {
         tp_cfg.flag.bs.ctp = 1;
-    } else if (cfg->trans_mode == URMA_TM_UM) {
+    } else if (cfg->use_utp) {
         tp_cfg.flag.bs.utp = 1;
     } else {
         tp_cfg.flag.bs.rtp = 1;
@@ -1597,13 +1783,21 @@ static int exchange_connection_info(perftest_context_t *ctx, perftest_config_t *
         goto exchange_jetty_id_fail;
     }
 
-    ret = exchange_credit_info(ctx, cfg);
+    if (is_bonding_duplex) {
+        ret = exchange_credit_seg_ctx(ctx, cfg);
+    } else {
+        ret = exchange_credit_info(ctx, cfg);
+    }
     if (ret != 0) {
         LOG_ERROR("Failed to exchange_credit_info, ret: %d\n", ret);
         goto exchange_credit_fail;
     }
 
-    ret = exchange_notify_info(ctx, cfg);
+    if (is_bonding_duplex) {
+        ret = exchange_notify_seg_ctx(ctx, cfg);
+    } else {
+        ret = exchange_notify_info(ctx, cfg);
+    }
     if (ret != 0) {
         LOG_ERROR("Failed to exchange_notify_info, ret: %d\n", ret);
         goto exchange_notify_fail;
@@ -1624,9 +1818,17 @@ static int exchange_connection_info(perftest_context_t *ctx, perftest_config_t *
 exchange_tp_info_fail:
     free_tp_info(ctx);
 create_tp_info_fail:
-    free_remote_notify(ctx);
+    if (ctx->remote_notify_seg_duplex != NULL) {
+        free_remote_notify_duplex(ctx, cfg);
+    } else {
+        free_remote_notify(ctx);
+    }
 exchange_notify_fail:
-    free_remote_credit(ctx);
+    if (ctx->remote_credit_seg_duplex != NULL) {
+        free_remote_credit_duplex(ctx, cfg);
+    } else {
+        free_remote_credit(ctx);
+    }
 exchange_credit_fail:
     if (ctx->remote_rjetty != NULL) {
         free_remote_rjetty(ctx, cfg);
@@ -1646,8 +1848,16 @@ static void destroy_connection_info(perftest_context_t *ctx, const perftest_conf
 {
     free_remote_tp_info(ctx);
     free_tp_info(ctx);
-    free_remote_notify(ctx);
-    free_remote_credit(ctx);
+    if (ctx->remote_notify_seg_duplex != NULL) {
+        free_remote_notify_duplex(ctx, cfg);
+    } else {
+        free_remote_notify(ctx);
+    }
+    if (ctx->remote_credit_seg_duplex != NULL) {
+        free_remote_credit_duplex(ctx, cfg);
+    } else {
+        free_remote_credit(ctx);
+    }
     if (ctx->remote_seg_duplex != NULL) {
         free_remote_seg_duplex(ctx, cfg);
     } else {
@@ -1782,7 +1992,10 @@ static int import_seg_for_duplex(perftest_context_t *ctx, perftest_config_t *cfg
             return -ENOMEM;
         }
         for (i = 0; i < (int)ctx->jetty_num; i++) {
-            ctx->import_credit_seg[i] = urma_import_seg(ctx->urma_ctx, &ctx->remote_credit_seg[i],
+            urma_seg_t *remote_credit_seg = (ctx->remote_credit_seg_duplex != NULL)
+                                                ? ctx->remote_credit_seg_duplex[i]
+                                                : &ctx->remote_credit_seg[i];
+            ctx->import_credit_seg[i] = urma_import_seg(ctx->urma_ctx, remote_credit_seg,
                                                         &g_perftest_token, 0, flag);
             if (ctx->import_credit_seg[i] == NULL) {
                 LOG_ERROR("Failed to import seg, loop:%d!\n", i);
@@ -1797,7 +2010,10 @@ static int import_seg_for_duplex(perftest_context_t *ctx, perftest_config_t *cfg
             goto free_credit;
         }
         for (i = 0; i < (int)ctx->jetty_num; i++) {
-            ctx->import_notify_seg[i] = urma_import_seg(ctx->urma_ctx, &ctx->remote_notify_seg[i],
+            urma_seg_t *remote_notify_seg = (ctx->remote_notify_seg_duplex != NULL)
+                                                ? ctx->remote_notify_seg_duplex[i]
+                                                : &ctx->remote_notify_seg[i];
+            ctx->import_notify_seg[i] = urma_import_seg(ctx->urma_ctx, remote_notify_seg,
                                                         &g_perftest_token, 0, flag);
             if (ctx->import_notify_seg[i] == NULL) {
                 LOG_ERROR("Failed to import seg for simplex, loop: %d!\n", i);
@@ -1866,7 +2082,7 @@ static int connect_jfr_default(perftest_context_t *ctx, const perftest_config_t 
         rjfr.trans_mode = cfg->trans_mode;
         if (cfg->use_ctp) {
             rjfr.tp_type = URMA_CTP;
-        } else if (rjfr.trans_mode == URMA_TM_UM) {
+        } else if (cfg->use_utp) {
             rjfr.tp_type = URMA_UTP;
         } else {
             rjfr.tp_type = URMA_RTP;
@@ -1913,7 +2129,7 @@ static int connect_jfr_tp_aware(perftest_context_t *ctx, const perftest_config_t
 
     for (uint32_t i = 0; i < ctx->jetty_num; i++) {
         urma_import_jfr_ex_cfg_t active_cfg = {0};
-        if (cfg->trans_mode == URMA_TM_UM || cfg->use_ctp) {
+        if (cfg->use_utp || cfg->use_ctp) {
             active_cfg.tp_handle = ctx->tp_info[i].tp_handle;
             active_cfg.tp_attr.tx_psn = (uint32_t)random();
         } else {
@@ -1928,7 +2144,7 @@ static int connect_jfr_tp_aware(perftest_context_t *ctx, const perftest_config_t
         rjfr.trans_mode = cfg->trans_mode;
         if (cfg->use_ctp) {
             rjfr.tp_type = URMA_CTP;
-        } else if (rjfr.trans_mode == URMA_TM_UM) {
+        } else if (cfg->use_utp) {
             rjfr.tp_type = URMA_UTP;
         } else {
             rjfr.tp_type = URMA_RTP;
@@ -2027,7 +2243,7 @@ static int connect_jetty_default(perftest_context_t *ctx, perftest_config_t *cfg
 
         if (cfg->use_ctp) {
             rjetty->tp_type = URMA_CTP;
-        } else if (rjetty->trans_mode == URMA_TM_UM) {
+        } else if (cfg->use_utp) {
             rjetty->tp_type = URMA_UTP;
         } else {
             rjetty->tp_type = URMA_RTP;
@@ -2080,7 +2296,7 @@ static int connect_jetty_tp_aware(perftest_context_t *ctx, perftest_config_t *cf
 
     for (uint32_t i = 0; i < ctx->jetty_num; i++) {
         urma_import_jfr_ex_cfg_t active_cfg = {0};
-        if (cfg->trans_mode == URMA_TM_UM || cfg->use_ctp) {
+        if (cfg->use_utp || cfg->use_ctp) {
             active_cfg.tp_handle = ctx->tp_info[i].tp_handle;
             active_cfg.tp_attr.tx_psn = (uint32_t)random();
         } else {
@@ -2098,7 +2314,7 @@ static int connect_jetty_tp_aware(perftest_context_t *ctx, perftest_config_t *cf
         }
         if (cfg->use_ctp) {
             rjetty->tp_type = URMA_CTP;
-        } else if (rjetty->trans_mode == URMA_TM_UM) {
+        } else if (cfg->use_utp) {
             rjetty->tp_type = URMA_UTP;
         } else {
             rjetty->tp_type = URMA_RTP;

@@ -5,21 +5,229 @@
  * Create: 2026-09-16
  */
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <signal.h>
 #include <time.h>
 #include <unistd.h>
 #include <stdbool.h>
 
 #include "ub_bench_run.h"
 #include "ub_bench_run_test.h"
+#include "ub_bench_mgmt.h"
 #include "urma_api.h"
+
+#define SEQ_PEER_EXIT_CMD ('Q')
 
 static const char *g_seq_sync_before[] = {"seq_before_read_bw", "seq_before_write_bw",
                                           "seq_before_send_bw", "seq_before_atomic_bw"};
 static const char *g_seq_sync_after[] = {"seq_after_read_bw", "seq_after_write_bw",
                                          "seq_after_send_bw", "seq_after_atomic_bw"};
+
+static void seq_catch_sigint(int sig)
+{
+    (void)sig;
+    g_exit_flag = 1;
+}
+
+/* Interval distribution = cumulative histogram difference (bucket-wise).
+ * All members are monotonic counters, so subtraction is well defined.
+ * min/max are running extremes and NOT differentiable; callers must not
+ * use them from the diff result. */
+static void hist_subtract(latency_hist_t *dst, const latency_hist_t *a, const latency_hist_t *b)
+{
+    for (int i = 0; i < HIST_BUCKET_NUM; i++) {
+        dst->buckets[i] = (a->buckets[i] > b->buckets[i]) ? (a->buckets[i] - b->buckets[i]) : 0;
+    }
+    dst->total_count = a->total_count - b->total_count;
+    dst->sum_delta = a->sum_delta - b->sum_delta;
+    dst->min_delta = 0;
+    dst->max_delta = 0;
+}
+
+static void print_sequential_header(const perftest_config_t *cfg);
+
+typedef struct {
+    perftest_context_t *ctx;
+    perftest_config_t *cfg;
+    bench_thread_arg_t *args;
+    uint32_t threads;
+    uint32_t period_ms;
+    double cpu_mhz;
+    uint32_t avg_size;
+    volatile int *stop;
+} seq_inf_print_ctx_t;
+
+/*
+ * Infinite (-y) print thread for sequential mode. Mirrors the pipeline
+ * infinite_print_thread control flow (comm_poll slices for peer-exit 'Q'
+ * detection + periodic reporting). Each periodic row uses the exact same
+ * header and column layout as the final sequential report, with interval
+ * (per-period) statistics computed from worker histogram snapshots.
+ */
+static void *seq_infinite_print_thread(void *arg)
+{
+    seq_inf_print_ctx_t *pc = (seq_inf_print_ctx_t *)arg;
+    perftest_config_t *cfg = pc->cfg;
+    int poll_slice_ms = ((int)pc->period_ms < 100) ? (int)pc->period_ms : 100;
+    uint32_t elapsed_ms = 0;
+    uint64_t last_cycles = get_cycles();
+    double cycles_to_sec = pc->cpu_mhz * PERFTEST_M;
+    const perftest_bw_unit_desc_t *unit = get_bw_unit_desc(cfg->bw_unit);
+    double unit_ratio = (double)unit->bytes_per_unit;
+
+    latency_hist_t *prev = calloc(1, sizeof(latency_hist_t));
+    latency_hist_t *now = calloc(1, sizeof(latency_hist_t));
+    latency_hist_t *diff = calloc(1, sizeof(latency_hist_t));
+    bool *responded = calloc(pc->threads, sizeof(bool));
+    /* prev starts as an all-zero baseline snapshot taken at thread start
+     * (the print thread is created before the workers), so the FIRST
+     * periodic line covers [thread start, first snapshot] with a correctly
+     * scoped interval denominator. */
+    bool have_prev = true;
+
+    print_sequential_header(cfg);
+
+    while (!*pc->stop && !g_exit_flag) {
+        int pr = comm_poll(cfg, 0, poll_slice_ms);
+        if (pr < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (pr > 0) {
+            char buf[1];
+            ssize_t n = comm_recv(cfg, 0, buf, sizeof(buf));
+            if (n <= 0 || buf[0] == SEQ_PEER_EXIT_CMD) {
+                g_exit_flag = 1;
+                break;
+            }
+            /* Keep normal synchronization data for the main thread. */
+            (void)usleep((uint32_t)poll_slice_ms * 1000);
+        }
+        elapsed_ms += (uint32_t)poll_slice_ms;
+        if (elapsed_ms < pc->period_ms) {
+            continue;
+        }
+        elapsed_ms = 0;
+
+        /* Request a consistent snapshot from every worker. */
+        for (uint32_t i = 0; i < pc->threads; i++) {
+            __atomic_store_n(&pc->args[i].snap_request, 1, __ATOMIC_RELEASE);
+        }
+        /* Workers respond within one packet gap; a thread isolated by
+         * error_suspend never responds and its histogram is frozen. Only
+         * responsive threads contribute to this interval's exact min/max. */
+        for (uint32_t i = 0; i < pc->threads; i++) {
+            responded[i] = false;
+        }
+        for (uint32_t w = 0; w < 100; w++) {
+            bool all = true;
+            for (uint32_t i = 0; i < pc->threads; i++) {
+                if (__atomic_load_n(&pc->args[i].snap_ready, __ATOMIC_ACQUIRE)) {
+                    responded[i] = true;
+                } else {
+                    all = false;
+                }
+            }
+            if (all || *pc->stop || g_exit_flag) {
+                break;
+            }
+            (void)usleep(1000);
+        }
+        hist_init(now);
+        uint64_t interval_min = (uint64_t)-1;
+        uint64_t interval_max = 0;
+        for (uint32_t i = 0; i < pc->threads; i++) {
+            if (responded[i]) {
+                if (pc->args[i].snap.min_delta < interval_min) {
+                    interval_min = pc->args[i].snap.min_delta;
+                }
+                if (pc->args[i].snap.max_delta > interval_max) {
+                    interval_max = pc->args[i].snap.max_delta;
+                }
+            }
+            hist_merge(now, &pc->args[i].snap);
+            __atomic_store_n(&pc->args[i].snap_ready, 0, __ATOMIC_RELAXED);
+        }
+
+        uint64_t now_cycles = get_cycles();
+        if (have_prev && now->total_count >= prev->total_count) {
+            hist_subtract(diff, now, prev);
+            double interval_s = (double)(now_cycles - last_cycles) / cycles_to_sec;
+            if (interval_s > 0.0 && diff->total_count > 0) {
+                double bw_avg = ((double)pc->avg_size * (double)diff->total_count) /
+                                (interval_s * unit_ratio);
+                double actual_qps = (double)diff->total_count / interval_s;
+                double msg_rate = actual_qps / (double)PERFTEST_M;
+                double t_min_us = (interval_min != (uint64_t)-1) ?
+                                  (double)interval_min / pc->cpu_mhz : 0.0;
+                double t_max_us = (double)interval_max / pc->cpu_mhz;
+                double t_median = (double)hist_percentile(diff, 0.5) / pc->cpu_mhz;
+                double t_avg = hist_avg(diff) / pc->cpu_mhz;
+                double p99 = (double)hist_percentile(diff, 0.99) / pc->cpu_mhz;
+                double p999 = (double)hist_percentile(diff, 0.999) / pc->cpu_mhz;
+                double p9999 = (double)hist_percentile(diff, 0.9999) / pc->cpu_mhz;
+                double p99999 = (double)hist_percentile(diff, 0.99999) / pc->cpu_mhz;
+                if (cfg->bw_only == false) {
+                    LOG_QUIET(" %-11u %-11lu %-13lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
+                              pc->avg_size, diff->total_count, (uint64_t)actual_qps, bw_avg, msg_rate,
+                              t_min_us, t_max_us, t_median, t_avg,
+                              p99, p999, p9999, p99999);
+                } else {
+                    LOG_QUIET(" %-11u %-11lu %-13lu %-13.2f %-13.6f\n",
+                              pc->avg_size, diff->total_count, (uint64_t)actual_qps, bw_avg, msg_rate);
+                }
+            }
+        }
+        /* Track the prev snapshot's timestamp unconditionally so the next
+         * interval denominator is scoped to [prev snapshot, now] even when
+         * this round printed nothing (first round / hist reset guard). */
+        last_cycles = now_cycles;
+        *prev = *now;
+        have_prev = true;
+    }
+
+    free(prev);
+    free(now);
+    free(diff);
+    free(responded);
+    return NULL;
+}
+
+typedef struct {
+    perftest_config_t *cfg;
+    volatile int *stop;
+} seq_inf_ctrl_ctx_t;
+
+/* Infinite (-y) server control thread: detect peer exit ('Q') and local
+ * SIGINT, propagate via g_exit_flag so recv workers stop. */
+static void *seq_infinite_server_ctrl(void *arg)
+{
+    seq_inf_ctrl_ctx_t *cc = (seq_inf_ctrl_ctx_t *)arg;
+
+    while (!*cc->stop && !g_exit_flag) {
+        int pr = comm_poll(cc->cfg, 0, 100);
+        if (pr < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (pr > 0) {
+            char buf[1];
+            ssize_t n = comm_recv(cc->cfg, 0, buf, sizeof(buf));
+            if (n <= 0 || buf[0] == SEQ_PEER_EXIT_CMD) {
+                g_exit_flag = 1;
+                break;
+            }
+        }
+    }
+    return NULL;
+}
 
 static void *sequential_worker(void *arg)
 {
@@ -37,7 +245,9 @@ static void *sequential_worker(void *arg)
     uint64_t next_deadline = 0;
 
     urma_jfs_wr_t *wr = &run_ctx->jfs_wr[id];
-    bool collecting = (cfg->time_type.bs.iterations == 1);
+    /* -y: no iteration bound, collect per-packet latency for the whole run.
+     * With -y -D the duration state machine below re-drives collecting. */
+    bool collecting = (cfg->time_type.bs.iterations == 1 || cfg->time_type.bs.infinite == 1);
     uint64_t sweep_start = 0;
     bool sweep_active = (t->time_limit_cycles > 0);
 
@@ -48,6 +258,9 @@ static void *sequential_worker(void *arg)
     t->start_time = get_cycles();
 
     while (1) {
+        if (g_exit_flag) {
+            break;
+        }
         if (sweep_active) {
             uint64_t elapsed = get_cycles() - sweep_start;
             if (elapsed >= t->time_limit_cycles) {
@@ -63,6 +276,8 @@ static void *sequential_worker(void *arg)
                 if (!collecting) {
                     collecting = true;
                     hist_reset(&t->hist);
+                    t->interval_min = (uint64_t)-1;
+                    t->interval_max = 0;
                     t->start_time = get_cycles();
                 }
             } else {
@@ -72,6 +287,12 @@ static void *sequential_worker(void *arg)
 
         if (interval > 0 && next_deadline > 0) {
             while (get_cycles() < next_deadline) {
+                if (g_exit_flag) {
+                    break;
+                }
+            }
+            if (g_exit_flag) {
+                break;
             }
         }
 
@@ -95,7 +316,7 @@ static void *sequential_worker(void *arg)
         int cqe_cnt;
         do {
             cqe_cnt = urma_poll_jfc(ctx->jfc_s[id], 1, &cr);
-        } while (cqe_cnt == 0 && !run_ctx->abort &&
+        } while (cqe_cnt == 0 && !run_ctx->abort && !g_exit_flag &&
                  (cfg->time_type.bs.iterations == 1 || run_ctx->state != END_STATE));
 
         if (cqe_cnt < 0) {
@@ -107,17 +328,27 @@ static void *sequential_worker(void *arg)
             break;
         }
         if (cr.status != URMA_CR_SUCCESS) {
-            if (__sync_bool_compare_and_swap(&run_ctx->abort, 0, 1)) {
-                LOG_ERROR("CR error: %s (status %d), thread %u.\n",
-                          cr_status_str((int)cr.status), (int)cr.status, id);
-                if (cr.status == URMA_CR_ACK_TIMEOUT_ERR) {
-                    LOG_ERROR("Hint: try reducing --threads or -s.\n");
-                } else if (cr.status == URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
-                    LOG_ERROR("Hint: receiver buffer exhausted, try increasing -R or reducing --threads.\n");
+            if (cfg->error_suspend == false) {
+                if (__sync_bool_compare_and_swap(&run_ctx->abort, 0, 1)) {
+                    LOG_ERROR("CR error: %s (status %d), thread %u.\n",
+                              cr_status_str((int)cr.status), (int)cr.status, id);
+                    if (cr.status == URMA_CR_ACK_TIMEOUT_ERR) {
+                        LOG_ERROR("Hint: try reducing --threads or -s.\n");
+                    } else if (cr.status == URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
+                        LOG_ERROR("Hint: receiver buffer exhausted, try increasing -R or reducing --threads.\n");
+                    }
                 }
+                t->end_time = get_cycles();
+                return (void *)(intptr_t)(-1);
             }
+            /* error_suspend: the JFS is suspended by HW; this thread cannot
+             * make progress, but the other threads own independent JFS/JFC
+             * and keep running. Isolate this thread instead of aborting. */
+            LOG_ERROR("CR error: %s (status %d), thread %u isolated (error_suspend).\n",
+                      cr_status_str((int)cr.status), (int)cr.status, id);
+            t->err_count++;
             t->end_time = get_cycles();
-            return (void *)(intptr_t)(-1);
+            return NULL;
         }
 
         uint64_t tcompleted = get_cycles();
@@ -128,6 +359,12 @@ static void *sequential_worker(void *arg)
 
         if (collecting) {
             hist_add(&t->hist, delta);
+            if (delta < t->interval_min) {
+                t->interval_min = delta;
+            }
+            if (delta > t->interval_max) {
+                t->interval_max = delta;
+            }
         }
 
         if (cfg->size <= (ctx->page_size / PERFTEST_BUF_NUM)) {
@@ -147,6 +384,20 @@ static void *sequential_worker(void *arg)
         }
 
         scnt++;
+
+        /* infinite: serve the print thread's snapshot request in the gap
+         * between packets; this thread is the only writer of t->hist.
+         * The staging carries cumulative buckets plus the EXACT interval
+         * extremes (snap.min/max); the interval trackers then restart. */
+        if (__atomic_load_n(&t->snap_request, __ATOMIC_ACQUIRE)) {
+            t->snap = t->hist;
+            t->snap.min_delta = t->interval_min;
+            t->snap.max_delta = t->interval_max;
+            t->interval_min = (uint64_t)-1;
+            t->interval_max = 0;
+            __atomic_store_n(&t->snap_ready, 1, __ATOMIC_RELEASE);
+            __atomic_store_n(&t->snap_request, 0, __ATOMIC_RELAXED);
+        }
 
         if (cfg->time_type.bs.iterations == 1 && scnt >= cfg->iters) {
             break;
@@ -185,6 +436,9 @@ static void *recv_server_worker(void *arg)
         if (run_ctx->abort) {
             break;
         }
+        if (g_exit_flag) {
+            break;
+        }
         if (cfg->time_type.bs.duration == 1) {
             if (run_ctx->state == END_STATE) {
                 break;
@@ -213,18 +467,27 @@ static void *recv_server_worker(void *arg)
 
         for (int i = 0; i < cqe_cnt; i++) {
             if (cr[i].status != URMA_CR_SUCCESS) {
-                if (__sync_bool_compare_and_swap(&run_ctx->abort, 0, 1)) {
-                    LOG_ERROR("CR error: %s (status %d), thread %u.\n",
-                              cr_status_str((int)cr[i].status), (int)cr[i].status, id);
-                    if (cr[i].status == URMA_CR_ACK_TIMEOUT_ERR) {
-                        LOG_ERROR("Hint: try reducing --threads or -s.\n");
-                    } else if (cr[i].status == URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
-                        LOG_ERROR("Hint: receiver buffer exhausted, try increasing -R or reducing --threads.\n");
+                if (cfg->error_suspend == false) {
+                    if (__sync_bool_compare_and_swap(&run_ctx->abort, 0, 1)) {
+                        LOG_ERROR("CR error: %s (status %d), thread %u.\n",
+                                  cr_status_str((int)cr[i].status), (int)cr[i].status, id);
+                        if (cr[i].status == URMA_CR_ACK_TIMEOUT_ERR) {
+                            LOG_ERROR("Hint: try reducing --threads or -s.\n");
+                        } else if (cr[i].status == URMA_CR_RNR_RETRY_CNT_EXC_ERR) {
+                            LOG_ERROR("Hint: receiver buffer exhausted, try increasing -R or reducing --threads.\n");
+                        }
                     }
+                    free(cr);
+                    t->end_time = get_cycles();
+                    return (void *)(intptr_t)(-1);
                 }
+                /* error_suspend: isolate this recv thread, others keep polling. */
+                LOG_ERROR("CR error: %s (status %d), recv thread %u isolated (error_suspend).\n",
+                          cr_status_str((int)cr[i].status), (int)cr[i].status, id);
+                t->err_count++;
                 free(cr);
                 t->end_time = get_cycles();
-                return (void *)(intptr_t)(-1);
+                return NULL;
             }
             rcnt++;
 
@@ -305,9 +568,33 @@ typedef struct {
     uint64_t total_count;
 } sweep_result_t;
 
-static void print_sequential_report(perftest_config_t *cfg, uint64_t total_count,
+/* Actual average message length: with random IO size the WR init drew each
+ * length into ctx->sum_size (per WR template), so the report must convert
+ * bandwidth with the drawn length, not the declared cfg->size. */
+static uint32_t get_actual_avg_size(const perftest_context_t *ctx, const perftest_config_t *cfg)
+{
+    if (ctx->sum_size == 0) {
+        return cfg->size;
+    }
+    return (uint32_t)(ctx->sum_size / (cfg->jfs_post_list * cfg->jettys));
+}
+
+static void print_sequential_header(const perftest_config_t *cfg)
+{
+    const char *unit_str = get_bw_unit_desc(cfg->bw_unit)->name;
+    LOG_QUIET("\n");
+    if (cfg->bw_only == false) {
+        LOG_QUIET(" bytes      iterations  QPS_actual   BW_avg[%s/s]  MsgRate[Mpps]  "
+                  "t_min[us]  t_max[us] t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us] \n",
+                  unit_str);
+    } else {
+        LOG_QUIET(" bytes      iterations  QPS_actual   BW_avg[%s/s] MsgRate[Mpps]\n", unit_str);
+    }
+}
+
+static void print_sequential_report(perftest_config_t *cfg, uint32_t avg_size, uint64_t total_count,
                                     uint64_t global_start, uint64_t global_end,
-                                    const latency_hist_t *merged_hist)
+                                    const latency_hist_t *merged_hist, bool print_header)
 {
     double cpu_mhz = get_cpu_mhz(false);
     if (cpu_mhz <= 0.0) {
@@ -316,23 +603,18 @@ static void print_sequential_report(perftest_config_t *cfg, uint64_t total_count
     }
 
     double cycles_to_units = cpu_mhz * PERFTEST_M;
-    double unit_ratio = (double)PERFTEST_BW_MB;
-    const char *unit_str = "MiB";
-    if (cfg->bw_unit == PERFTEST_KB) {
-        unit_ratio = (double)PERFTEST_BW_KB;
-        unit_str = "KiB";
-    } else if (cfg->bw_unit == PERFTEST_GB) {
-        unit_ratio = (double)PERFTEST_BW_GB;
-        unit_str = "GiB";
-    }
+    const perftest_bw_unit_desc_t *unit_desc = get_bw_unit_desc(cfg->bw_unit);
+    double unit_ratio = (double)unit_desc->bytes_per_unit;
 
     uint64_t cycles_sum = global_end - global_start;
-    double bw_avg = ((double)cfg->size * total_count * cycles_to_units) /
+    double bw_avg = ((double)avg_size * total_count * cycles_to_units) /
                     ((double)cycles_sum * unit_ratio);
     double actual_qps = (double)total_count * cycles_to_units / (double)cycles_sum;
     double msg_rate = actual_qps / (double)PERFTEST_M;
 
-    LOG_QUIET("\n");
+    if (print_header) {
+        print_sequential_header(cfg);
+    }
     if (cfg->bw_only == false) {
         double t_avg_us = hist_avg(merged_hist) / cpu_mhz;
         double t_min_us = (merged_hist->min_delta < (uint64_t)-1) ?
@@ -344,18 +626,14 @@ static void print_sequential_report(perftest_config_t *cfg, uint64_t total_count
         uint64_t p99999 = hist_percentile(merged_hist, 0.99999);
         uint64_t pmax = merged_hist->max_delta;
 
-        LOG_QUIET(" bytes      iterations  QPS_actual   BW_avg[%s/s]  MsgRate[Mpps]  "
-                  "t_min[us]  t_max[us] t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us] \n",
-                  unit_str);
         LOG_QUIET(" %-11u %-11lu %-13lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
-                  cfg->size, total_count, (uint64_t)actual_qps, bw_avg, msg_rate,
+                  avg_size, total_count, (uint64_t)actual_qps, bw_avg, msg_rate,
                   t_min_us, (double)pmax / cpu_mhz, (double)p50 / cpu_mhz, t_avg_us,
                   (double)p99 / cpu_mhz, (double)p999 / cpu_mhz,
                   (double)p9999 / cpu_mhz, (double)p99999 / cpu_mhz);
     } else {
-        LOG_QUIET(" bytes      iterations  QPS_actual   BW_avg[%s/s] MsgRate[Mpps]\n", unit_str);
         LOG_QUIET(" %-11u %-11lu %-13lu %-13.2f %-13.6f\n",
-                  cfg->size, total_count, (uint64_t)actual_qps, bw_avg, msg_rate);
+                  avg_size, total_count, (uint64_t)actual_qps, bw_avg, msg_rate);
     }
 }
 
@@ -369,15 +647,8 @@ static void print_sequential_report_from_data(const sequential_report_data_t *da
     }
 
     double cycles_to_units = cpu_mhz * PERFTEST_M;
-    double unit_ratio = (double)PERFTEST_BW_MB;
-    const char *unit_str = "MiB";
-    if (cfg->bw_unit == PERFTEST_KB) {
-        unit_ratio = (double)PERFTEST_BW_KB;
-        unit_str = "KiB";
-    } else if (cfg->bw_unit == PERFTEST_GB) {
-        unit_ratio = (double)PERFTEST_BW_GB;
-        unit_str = "GiB";
-    }
+    const perftest_bw_unit_desc_t *unit_desc = get_bw_unit_desc(cfg->bw_unit);
+    double unit_ratio = (double)unit_desc->bytes_per_unit;
 
     uint64_t cycles_sum = data->global_end - data->global_start;
     double bw_avg = ((double)data->size * data->total_count * cycles_to_units) /
@@ -385,23 +656,15 @@ static void print_sequential_report_from_data(const sequential_report_data_t *da
     double actual_qps = (double)data->total_count * cycles_to_units / (double)cycles_sum;
     double msg_rate = actual_qps / (double)PERFTEST_M;
 
-        if (header) {
-            LOG_QUIET("\n");
-        }
+    if (header) {
+        print_sequential_header(cfg);
+    }
     if (data->bw_only == false) {
-        if (header) {
-            LOG_QUIET(" bytes      iterations  QPS_actual   BW_avg[%s/s]  MsgRate[Mpps]  "
-                      "t_min[us]  t_max[us] t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us] \n",
-                      unit_str);
-        }
         LOG_QUIET(" %-11u %-11lu %-13lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
                   data->size, data->total_count, (uint64_t)actual_qps, bw_avg, msg_rate,
                   data->t_min, data->pmax, data->t_median, data->t_avg,
                   data->p99, data->p999, data->p9999, data->p99999);
     } else {
-        if (header) {
-            LOG_QUIET(" bytes      iterations  QPS_actual   BW_avg[%s/s] MsgRate[Mpps]\n", unit_str);
-        }
         LOG_QUIET(" %-11u %-11lu %-13lu %-13.2f %-13.6f\n",
                   data->size, data->total_count, (uint64_t)actual_qps, bw_avg, msg_rate);
     }
@@ -412,21 +675,13 @@ static int run_sequential_client(perftest_context_t *ctx, perftest_config_t *cfg
     uint32_t i;
     int ret;
 
-    /* Exchange sweep_count (0 for non-sweep) to match server's sync_data call */
-    uint32_t sweep_count = 0;
-    for (i = 0; i < cfg->pair_num; i++) {
-        if (sync_data(cfg, i, sizeof(uint32_t), (char *)&sweep_count,
-                      (char *)&sweep_count) != 0) {
-            return -1;
-        }
-    }
-
     ret = prepare_jfs_wr(ctx, cfg);
     if (ret != 0) {
         return -1;
     }
 
     if (cfg->warm_up && perform_warm_up(ctx, cfg) != 0) {
+        destroy_jfs_wr(ctx);
         return -1;
     }
 
@@ -454,14 +709,47 @@ static int run_sequential_client(perftest_context_t *ctx, perftest_config_t *cfg
         args[i].jetty_count = 1;
         args[i].cpu_mhz = cpu_mhz;
         hist_init(&args[i].hist);
+        args[i].interval_min = (uint64_t)-1;
+        args[i].interval_max = 0;
     }
 
     if (cfg->time_type.bs.iterations == 1) {
         ctx->run_ctx.tposted[0] = get_cycles();
     }
 
+    /* infinite (-y): start the periodic print thread (peer-exit detection +
+     * interval latency reporting) before the workers. */
+    volatile int inf_stop = 0;
+    seq_inf_print_ctx_t pc = {0};
+    pthread_t print_tid;
+    bool inf_print_on = false;
+    if (cfg->time_type.bs.infinite == 1) {
+        g_exit_flag = 0;
+        (void)signal(SIGINT, seq_catch_sigint);
+        pc.ctx = ctx;
+        pc.cfg = cfg;
+        pc.args = args;
+        pc.threads = cfg->threads;
+        pc.period_ms = (cfg->inf_period_ms > 0) ? cfg->inf_period_ms : (uint32_t)cfg->inf_period * 1000;
+        pc.cpu_mhz = cpu_mhz;
+        pc.avg_size = get_actual_avg_size(ctx, cfg);
+        pc.stop = &inf_stop;
+        if (pthread_create(&print_tid, NULL, seq_infinite_print_thread, &pc) != 0) {
+            LOG_ERROR("Failed to create infinite print thread.\n");
+            (void)signal(SIGINT, SIG_DFL);
+            free(args);
+            return -1;
+        }
+        inf_print_on = true;
+    }
+
     for (i = 0; i < cfg->threads; i++) {
         if (pthread_create(&args[i].tid, NULL, sequential_worker, &args[i]) != 0) {
+            if (inf_print_on) {
+                inf_stop = 1;
+                (void)pthread_join(print_tid, NULL);
+                (void)signal(SIGINT, SIG_DFL);
+            }
             for (uint32_t j = 0; j < i; j++) {
                 pthread_join(args[j].tid, NULL);
             }
@@ -472,11 +760,27 @@ static int run_sequential_client(perftest_context_t *ctx, perftest_config_t *cfg
 
     void *thread_ret;
     int worker_err = 0;
+    uint32_t err_threads = 0;
     for (i = 0; i < cfg->threads; i++) {
         pthread_join(args[i].tid, &thread_ret);
         if (thread_ret != NULL) {
             worker_err = -1;
         }
+        if (args[i].err_count > 0) {
+            err_threads++;
+        }
+    }
+
+    if (inf_print_on) {
+        inf_stop = 1;
+        void *print_ret;
+        (void)pthread_join(print_tid, &print_ret);
+        /* Ctrl-C exit: notify the peer before the tail; the tail syncs below
+         * are skipped so no partial mgmt message is left in flight. */
+        if (g_exit_flag) {
+            notify_peer_exit();
+        }
+        (void)signal(SIGINT, SIG_DFL);
     }
 
     if (cfg->time_type.bs.iterations == 1) {
@@ -487,6 +791,9 @@ static int run_sequential_client(perftest_context_t *ctx, perftest_config_t *cfg
         ctx->run_ctx.abort = 1;
         free(args);
         return -1;
+    }
+    if (err_threads > 0) {
+        LOG_QUIET(" Error threads       : %u/%u isolated (error_suspend)\n", err_threads, cfg->threads);
     }
 
     latency_hist_t global_hist;
@@ -511,38 +818,47 @@ static int run_sequential_client(perftest_context_t *ctx, perftest_config_t *cfg
         global_end = ctx->run_ctx.tcompleted[0];
     }
 
-    print_sequential_report(cfg, total_count, global_start, global_end, &global_hist);
-
-    for (i = 0; i < cfg->pair_num; i++) {
-        sync_time(cfg, i, g_seq_sync_after[cfg->api_type]);
+    uint32_t avg_size = get_actual_avg_size(ctx, cfg);
+    /* -y: no final report, matching the pipeline infinite convention — the
+     * last periodic line is the client's final output; the server still
+     * prints its row from the report exchange below. */
+    if (cfg->time_type.bs.infinite == 0) {
+        print_sequential_report(cfg, avg_size, total_count, global_start, global_end, &global_hist, !cfg->all);
     }
 
-    {
-        sequential_report_data_t sdata = {0};
-        sdata.size = cfg->size;
-        sdata.total_count = total_count;
-        sdata.global_start = global_start;
-        sdata.global_end = global_end;
-        sdata.target_qps = (cfg->qps > 0) ? (uint64_t)cfg->threads * cfg->qps : 0;
-        sdata.bw_only = cfg->bw_only;
-        if (cfg->bw_only == false && total_count > 0) {
-            sdata.t_min = (global_hist.min_delta < (uint64_t)-1) ?
-                          (double)global_hist.min_delta / cpu_mhz : 0.0;
-            sdata.t_median = (double)hist_percentile(&global_hist, 0.5) / cpu_mhz;
-            sdata.t_avg = hist_avg(&global_hist) / cpu_mhz;
-            sdata.p99 = (double)hist_percentile(&global_hist, 0.99) / cpu_mhz;
-            sdata.p999 = (double)hist_percentile(&global_hist, 0.999) / cpu_mhz;
-            sdata.p9999 = (double)hist_percentile(&global_hist, 0.9999) / cpu_mhz;
-            sdata.p99999 = (double)hist_percentile(&global_hist, 0.99999) / cpu_mhz;
-            sdata.pmax = (double)global_hist.max_delta / cpu_mhz;
-        }
-        sequential_report_data_t remote_data = {0};
+    if (g_exit_flag == 0) {
         for (i = 0; i < cfg->pair_num; i++) {
-            sync_data(cfg, i, sizeof(sequential_report_data_t),
-                      (char *)&sdata, (char *)&remote_data);
+            sync_time(cfg, i, g_seq_sync_after[cfg->api_type]);
+        }
+
+        {
+            sequential_report_data_t sdata = {0};
+            sdata.size = avg_size;
+            sdata.total_count = total_count;
+            sdata.global_start = global_start;
+            sdata.global_end = global_end;
+            sdata.target_qps = (cfg->qps > 0) ? (uint64_t)cfg->threads * cfg->qps : 0;
+            sdata.bw_only = cfg->bw_only;
+            if (cfg->bw_only == false && total_count > 0) {
+                sdata.t_min = (global_hist.min_delta < (uint64_t)-1) ?
+                              (double)global_hist.min_delta / cpu_mhz : 0.0;
+                sdata.t_median = (double)hist_percentile(&global_hist, 0.5) / cpu_mhz;
+                sdata.t_avg = hist_avg(&global_hist) / cpu_mhz;
+                sdata.p99 = (double)hist_percentile(&global_hist, 0.99) / cpu_mhz;
+                sdata.p999 = (double)hist_percentile(&global_hist, 0.999) / cpu_mhz;
+                sdata.p9999 = (double)hist_percentile(&global_hist, 0.9999) / cpu_mhz;
+                sdata.p99999 = (double)hist_percentile(&global_hist, 0.99999) / cpu_mhz;
+                sdata.pmax = (double)global_hist.max_delta / cpu_mhz;
+            }
+            sequential_report_data_t remote_data = {0};
+            for (i = 0; i < cfg->pair_num; i++) {
+                sync_data(cfg, i, sizeof(sequential_report_data_t),
+                          (char *)&sdata, (char *)&remote_data);
+            }
         }
     }
 
+    destroy_jfs_wr(ctx);
     free(args);
     return 0;
 }
@@ -558,15 +874,8 @@ static int run_sweep_client(perftest_context_t *ctx, perftest_config_t *cfg)
     }
 
     if (cfg->warm_up && perform_warm_up(ctx, cfg) != 0) {
+        destroy_jfs_wr(ctx);
         return -1;
-    }
-
-    uint32_t sweep_count = cfg->sweep_steps;
-    for (i = 0; i < cfg->pair_num; i++) {
-        if (sync_data(cfg, i, sizeof(uint32_t), (char *)&sweep_count,
-                      (char *)&sweep_count) != 0) {
-            return -1;
-        }
     }
 
     sweep_result_t *results = calloc(cfg->sweep_steps, sizeof(sweep_result_t));
@@ -574,12 +883,14 @@ static int run_sweep_client(perftest_context_t *ctx, perftest_config_t *cfg)
         return -1;
     }
 
+    /* The WR set is prepared once for all sweep steps, so the drawn lengths
+     * (random IO size) are fixed for this whole sweep; report their mean. */
+    uint32_t avg_size = get_actual_avg_size(ctx, cfg);
+
     double cpu_mhz = get_cpu_mhz(false);
-    double unit_ratio = (cfg->bw_unit == PERFTEST_MB) ? (double)PERFTEST_BW_MB :
-                        (cfg->bw_unit == PERFTEST_KB) ? (double)PERFTEST_BW_KB :
-                        (double)PERFTEST_BW_GB;
-    const char *unit_str = (cfg->bw_unit == PERFTEST_MB) ? "MiB" :
-                           (cfg->bw_unit == PERFTEST_KB) ? "KiB" : "GiB";
+    const perftest_bw_unit_desc_t *unit_desc = get_bw_unit_desc(cfg->bw_unit);
+    double unit_ratio = (double)unit_desc->bytes_per_unit;
+    const char *unit_str = unit_desc->name;
 
     for (uint32_t s = 0; s < cfg->sweep_steps; s++) {
         uint64_t target_qps = cfg->sweep_start + (uint64_t)s * cfg->sweep_step;
@@ -636,6 +947,16 @@ static int run_sweep_client(perftest_context_t *ctx, perftest_config_t *cfg)
             return -1;
         }
 
+        uint32_t err_threads = 0;
+        for (i = 0; i < cfg->threads; i++) {
+            if (args[i].err_count > 0) {
+                err_threads++;
+            }
+        }
+        if (err_threads > 0) {
+            LOG_QUIET(" Error threads       : %u/%u isolated (error_suspend)\n", err_threads, cfg->threads);
+        }
+
         latency_hist_t merged;
         hist_init(&merged);
         uint64_t total_count = 0;
@@ -653,7 +974,7 @@ static int run_sweep_client(perftest_context_t *ctx, perftest_config_t *cfg)
             }
         }
 
-        double bw_avg = ((double)cfg->size * total_count * cpu_mhz * PERFTEST_M) /
+        double bw_avg = ((double)avg_size * total_count * cpu_mhz * PERFTEST_M) /
                         ((double)(global_end - global_start) * unit_ratio);
         double t_avg = hist_avg(&merged) / cpu_mhz;
         double actual_qps = (double)total_count * cpu_mhz * PERFTEST_M /
@@ -679,7 +1000,7 @@ static int run_sweep_client(perftest_context_t *ctx, perftest_config_t *cfg)
         for (i = 0; i < cfg->pair_num; i++) {
             sync_time(cfg, i, g_seq_sync_after[cfg->api_type]);
             sequential_report_data_t sdata = {0};
-            sdata.size = cfg->size;
+            sdata.size = avg_size;
             sdata.total_count = total_count;
             sdata.global_start = global_start;
             sdata.global_end = global_end;
@@ -710,7 +1031,7 @@ static int run_sweep_client(perftest_context_t *ctx, perftest_config_t *cfg)
               unit_str);
     for (uint32_t s = 0; s < cfg->sweep_steps; s++) {
         LOG_QUIET(" %-11u %-11lu %-13lu %-14.2f %-14.6f %-10.2f %-9.2f %-13.2f %-10.2f %-8.2f %-10.2f %-11.2f %-12.2f\n",
-                  cfg->size,
+                  avg_size,
                   results[s].total_count,
                   results[s].actual_total_qps,
                   results[s].bw_avg, results[s].msg_rate,
@@ -722,11 +1043,12 @@ static int run_sweep_client(perftest_context_t *ctx, perftest_config_t *cfg)
                   (double)results[s].p99999 / cpu_mhz);
     }
 
+    destroy_jfs_wr(ctx);
     free(results);
     return 0;
 }
 
-static int run_recv_server_mt(perftest_context_t *ctx, perftest_config_t *cfg)
+static int run_recv_server_mt(perftest_context_t *ctx, perftest_config_t *cfg, bool print_header)
 {
     uint32_t i;
 
@@ -756,8 +1078,33 @@ static int run_recv_server_mt(perftest_context_t *ctx, perftest_config_t *cfg)
         args[i].cpu_mhz = cpu_mhz;
     }
 
+    /* infinite (-y): control thread detects peer exit ('Q') / local SIGINT and
+     * stops the recv workers via g_exit_flag. */
+    volatile int ctrl_stop = 0;
+    seq_inf_ctrl_ctx_t cc = {0};
+    pthread_t ctrl_tid;
+    bool ctrl_on = false;
+    if (cfg->time_type.bs.infinite == 1) {
+        g_exit_flag = 0;
+        (void)signal(SIGINT, seq_catch_sigint);
+        cc.cfg = cfg;
+        cc.stop = &ctrl_stop;
+        if (pthread_create(&ctrl_tid, NULL, seq_infinite_server_ctrl, &cc) != 0) {
+            LOG_ERROR("Failed to create infinite control thread.\n");
+            (void)signal(SIGINT, SIG_DFL);
+            free(args);
+            return -1;
+        }
+        ctrl_on = true;
+    }
+
     for (i = 0; i < cfg->threads; i++) {
         if (pthread_create(&args[i].tid, NULL, recv_server_worker, &args[i]) != 0) {
+            if (ctrl_on) {
+                ctrl_stop = 1;
+                (void)pthread_join(ctrl_tid, NULL);
+                (void)signal(SIGINT, SIG_DFL);
+            }
             for (uint32_t j = 0; j < i; j++) {
                 pthread_join(args[j].tid, NULL);
             }
@@ -775,10 +1122,30 @@ static int run_recv_server_mt(perftest_context_t *ctx, perftest_config_t *cfg)
         }
     }
 
+    if (ctrl_on) {
+        ctrl_stop = 1;
+        void *ctrl_ret;
+        (void)pthread_join(ctrl_tid, &ctrl_ret);
+        if (g_exit_flag) {
+            notify_peer_exit();
+        }
+        (void)signal(SIGINT, SIG_DFL);
+    }
+
     if (worker_err != 0) {
         ctx->run_ctx.abort = 1;
         free(args);
         return -1;
+    }
+
+    uint32_t err_threads = 0;
+    for (i = 0; i < cfg->threads; i++) {
+        if (args[i].err_count > 0) {
+            err_threads++;
+        }
+    }
+    if (err_threads > 0) {
+        LOG_QUIET(" Error threads       : %u/%u isolated (error_suspend)\n", err_threads, cfg->threads);
     }
 
     uint64_t total_count = 0;
@@ -800,6 +1167,17 @@ static int run_recv_server_mt(perftest_context_t *ctx, perftest_config_t *cfg)
         global_end = ctx->run_ctx.tcompleted[0];
     }
 
+    if (cfg->time_type.bs.infinite == 1 && g_exit_flag) {
+        /* Ctrl-C / peer-exit: the report exchange is unavailable (the client
+         * is gone); print local receive stats from the worker counters. */
+        double cycles_to_sec = cpu_mhz * PERFTEST_M;
+        double elapsed_s = (double)(global_end - global_start) / cycles_to_sec;
+        LOG_QUIET(" server received %lu packets in %.1f s (infinite exit)\n",
+                  total_count, elapsed_s);
+        free(args);
+        return 0;
+    }
+
     for (i = 0; i < cfg->pair_num; i++) {
         if (sync_time(cfg, i, g_seq_sync_after[cfg->api_type]) != 0) {
             free(args);
@@ -819,7 +1197,7 @@ static int run_recv_server_mt(perftest_context_t *ctx, perftest_config_t *cfg)
         remote.global_start = global_start;
         remote.global_end = global_end;
         remote.bw_only = true;
-        print_sequential_report_from_data(&remote, cfg, true);
+        print_sequential_report_from_data(&remote, cfg, print_header);
     }
 
     free(args);
@@ -831,60 +1209,80 @@ int bench_run_sequential(perftest_context_t *ctx, perftest_config_t *cfg)
     uint32_t i;
 
     if (cfg->server_ip == NULL && !cfg->bidirection) {
-        uint32_t sweep_count = 0;
+        /* Total rounds driven by the client: (sizes when --all) x (sweep steps).
+         * 0 keeps the legacy meaning "non-sweep single size" -> 1 round. */
+        uint32_t total_rounds = 0;
         for (i = 0; i < cfg->pair_num; i++) {
-            if (sync_data(cfg, i, sizeof(uint32_t), (char *)&sweep_count,
-                          (char *)&sweep_count) != 0) {
+            if (sync_data(cfg, i, sizeof(uint32_t), (char *)&total_rounds,
+                          (char *)&total_rounds) != 0) {
                 return -1;
             }
         }
-        cfg->sweep_steps = sweep_count;
-        cfg->sweep = (sweep_count > 0);
-
-        if (cfg->cmd == PERFTEST_SEND_BW) {
-            if (prepare_jfr_wr(ctx, cfg) != 0) {
-                LOG_ERROR("Failed to prepare jfr wr for send_bw server.\n");
-                return -1;
-            }
+        if (total_rounds == 0) {
+            total_rounds = 1;
         }
+        cfg->sweep_steps = total_rounds;
 
         if (cfg->cmd == PERFTEST_SEND_BW) {
-            if (cfg->threads > 1) {
-                return run_recv_server_mt(ctx, cfg);
-            }
-            for (i = 0; i < cfg->pair_num; i++) {
-                if (sync_time(cfg, i, g_seq_sync_before[cfg->api_type]) != 0) {
+            uint32_t rounds = (cfg->all == true) ? cfg->order : 1;
+            for (uint32_t r = 0; r < rounds; r++) {
+                int ret = 0;
+                if (r > 0 && recreate_jetty(ctx, cfg) != 0) {
+                    LOG_ERROR("Failed to recreate jetty, round: %u.\n", r);
                     return -1;
                 }
-                uint64_t server_rcnt = 0;
-                if (run_once_bw_recv(ctx, cfg, &server_rcnt) != 0) {
-                    LOG_ERROR("Failed to run recv in send_bw server.\n");
+                if (prepare_jfr_wr(ctx, cfg) != 0) {
+                    LOG_ERROR("Failed to prepare jfr wr for send_bw server.\n");
                     return -1;
                 }
-                if (sync_time(cfg, i, g_seq_sync_after[cfg->api_type]) != 0) {
+                /* infinite forces the worker-based recv path (run_once_bw_recv
+                 * is count-bound and shared with pipeline). */
+                if (cfg->threads > 1 || cfg->time_type.bs.infinite == 1) {
+                    ret = run_recv_server_mt(ctx, cfg, (cfg->all == true) ? (r == 0) : true);
+                } else {
+                    for (i = 0; i < cfg->pair_num; i++) {
+                        if (sync_time(cfg, i, g_seq_sync_before[cfg->api_type]) != 0) {
+                            ret = -1;
+                            break;
+                        }
+                        uint64_t server_rcnt = 0;
+                        if (run_once_bw_recv(ctx, cfg, &server_rcnt) != 0) {
+                            LOG_ERROR("Failed to run recv in send_bw server.\n");
+                            ret = -1;
+                            break;
+                        }
+                        if (sync_time(cfg, i, g_seq_sync_after[cfg->api_type]) != 0) {
+                            ret = -1;
+                            break;
+                        }
+                        sequential_report_data_t local = {0};
+                        sequential_report_data_t remote = {0};
+                        if (sync_data(cfg, i, sizeof(sequential_report_data_t),
+                                      (char *)&local, (char *)&remote) != 0) {
+                            ret = -1;
+                            break;
+                        }
+                        if (ctx->run_ctx.tposted[0] > 0 && ctx->run_ctx.tcompleted[0] > 0) {
+                            remote.global_start = ctx->run_ctx.tposted[0];
+                            remote.global_end = ctx->run_ctx.tcompleted[0];
+                        }
+                        remote.total_count = server_rcnt;
+                        remote.bw_only = true;
+                        print_sequential_report_from_data(&remote, cfg,
+                                                          (cfg->all == true) ? (r == 0) : true);
+                    }
+                }
+                destroy_jfr_wr(ctx);
+                if (ret != 0) {
                     return -1;
                 }
-                sequential_report_data_t local = {0};
-                sequential_report_data_t remote = {0};
-                if (sync_data(cfg, i, sizeof(sequential_report_data_t),
-                              (char *)&local, (char *)&remote) != 0) {
-                    return -1;
-                }
-                if (ctx->run_ctx.tposted[0] > 0 && ctx->run_ctx.tcompleted[0] > 0) {
-                    remote.global_start = ctx->run_ctx.tposted[0];
-                    remote.global_end = ctx->run_ctx.tcompleted[0];
-                }
-                remote.total_count = server_rcnt;
-                remote.bw_only = true;
-                print_sequential_report_from_data(&remote, cfg, true);
             }
             return 0;
         }
 
-        uint32_t loop_count = cfg->sweep ? cfg->sweep_steps : 1;
+        uint32_t loop_count = total_rounds;
         if (cfg->sweep) {
-            const char *srv_unit_str = (cfg->bw_unit == PERFTEST_KB) ? "KiB" :
-                                       (cfg->bw_unit == PERFTEST_GB) ? "GiB" : "MiB";
+            const char *srv_unit_str = get_bw_unit_desc(cfg->bw_unit)->name;
             LOG_QUIET("\n");
             LOG_QUIET(" bytes      iterations  QPS_actual   BW_avg[%s/s]  MsgRate[Mpps]  "
                       "t_min[us]  t_max[us] t_median[us]  t_avg[us]  99%%[us]  99.9%%[us]  99.99%%[us]  99.999%%[us] \n",
@@ -904,14 +1302,53 @@ int bench_run_sequential(perftest_context_t *ctx, perftest_config_t *cfg)
                               (char *)&local, (char *)&remote) != 0) {
                     return -1;
                 }
-                print_sequential_report_from_data(&remote, cfg, !cfg->sweep);
+                print_sequential_report_from_data(&remote, cfg, (s == 0 && !cfg->sweep));
             }
         }
         return 0;
     }
 
-    if (cfg->sweep) {
-        return run_sweep_client(ctx, cfg);
+    /* CLIENT: exchange total rounds with the server first, then drive rounds. */
+    uint32_t total_rounds = (uint32_t)((cfg->all ? cfg->order : 1) *
+                                       (cfg->sweep ? cfg->sweep_steps : 1));
+    for (i = 0; i < cfg->pair_num; i++) {
+        if (sync_data(cfg, i, sizeof(uint32_t), (char *)&total_rounds,
+                      (char *)&total_rounds) != 0) {
+            return -1;
+        }
     }
-    return run_sequential_client(ctx, cfg);
+
+    if (cfg->sweep) {
+        uint32_t sizes = cfg->all ? cfg->order : 1;
+        for (uint32_t s = 0; s < sizes; s++) {
+            if (cfg->all) {
+                cfg->size = 1U << (s + 1);
+            }
+            if (run_sweep_client(ctx, cfg) != 0) {
+                return -1;
+            }
+        }
+        return 0;
+    }
+
+    uint32_t sizes = cfg->all ? cfg->order : 1;
+    if (cfg->all) {
+        /* One header, one row per size — same convention as the pipeline -a scan. */
+        print_sequential_header(cfg);
+    }
+    for (uint32_t s = 0; s < sizes; s++) {
+        if (cfg->all) {
+            cfg->size = 1U << (s + 1);
+            /* send_bw server recreates its jfr per round; the paired syncs
+             * inside recreate_jetty require the client to call it too. */
+            if (s > 0 && cfg->cmd == PERFTEST_SEND_BW && recreate_jetty(ctx, cfg) != 0) {
+                LOG_ERROR("Failed to recreate jetty, size: %u.\n", cfg->size);
+                return -1;
+            }
+        }
+        if (run_sequential_client(ctx, cfg) != 0) {
+            return -1;
+        }
+    }
+    return 0;
 }
