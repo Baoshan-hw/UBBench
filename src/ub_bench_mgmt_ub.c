@@ -694,7 +694,7 @@ int ub_sync_data(uint32_t index, int size, char *local_data, char *remote_data)
                 consumed_buf_idx = (int)cr.user_ctx;
                 recv_done = true;
             } else {
-                /* Next round's recv arrived before our send CQE — stash. */
+                /* Next round's recv arrived before our send CQE -- stash. */
                 g_ub_ctx->pair.have_deferred_recv = true;
                 g_ub_ctx->pair.deferred_buf_idx = (uint32_t)cr.user_ctx;
             }

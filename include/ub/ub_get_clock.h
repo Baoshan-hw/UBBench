@@ -1,8 +1,7 @@
-﻿/*
+/*
  * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2022-2025. All rights reserved.
  * Description: clock for ub_bench
- * Author: Qian Guoxin
  * Create: 2022-04-03
  * Note:
  * History: 2022-04-03   create file

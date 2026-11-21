@@ -72,6 +72,10 @@ typedef struct run_test_ctx {
     uint32_t duration;
     volatile duration_states_t state;
     volatile int abort;
+    /* infinite (-y) send_bw server: total received packets, bumped with a
+     * relaxed atomic by recv workers and read by the control thread for
+     * periodic interval reporting. Server side measures no latency. */
+    uint64_t inf_recv_count;
     uint64_t rid;
     uint64_t *tposted;    // cycles
     uint64_t *tcompleted; // cycles

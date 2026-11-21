@@ -2,7 +2,6 @@
  * SPDX-License-Identifier: MIT
  * Copyright (c) Huawei Technologies Co., Ltd. 2020-2025. All rights reserved.
  * Description: ub util head file
- * Author: Lilijun
  * Create: 2020-8-11
  * Note:
  * History:

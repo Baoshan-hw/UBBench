@@ -201,16 +201,38 @@ static void *seq_infinite_print_thread(void *arg)
 typedef struct {
     perftest_config_t *cfg;
     volatile int *stop;
+    /* periodic reporting (send_bw server): interval deltas of the shared
+     * recv counter; avg_size and cpu_mhz for BW conversion */
+    uint64_t *recv_count;
+    uint32_t period_ms;
+    double cpu_mhz;
+    uint32_t avg_size;
 } seq_inf_ctrl_ctx_t;
 
 /* Infinite (-y) server control thread: detect peer exit ('Q') and local
- * SIGINT, propagate via g_exit_flag so recv workers stop. */
+ * SIGINT, propagate via g_exit_flag so recv workers stop; for send_bw also
+ * print periodic 5-column receive statistics (server measures no latency,
+ * so the row carries counters only — same columns as its final row). */
 static void *seq_infinite_server_ctrl(void *arg)
 {
     seq_inf_ctrl_ctx_t *cc = (seq_inf_ctrl_ctx_t *)arg;
+    uint32_t period_ms = cc->period_ms;
+    int poll_slice_ms = ((int)period_ms < 100) ? (int)period_ms : 100;
+    uint32_t elapsed_ms = 0;
+    uint64_t last_count = 0;
+    uint64_t last_cycles = get_cycles();
+    double cycles_to_sec = cc->cpu_mhz * PERFTEST_M;
+    const perftest_bw_unit_desc_t *unit = get_bw_unit_desc(cc->cfg->bw_unit);
+    double unit_ratio = (double)unit->bytes_per_unit;
+
+    if (cc->recv_count != NULL) {
+        /* Same header/columns as the bw_only sequential report row: the
+         * server measures no latency, so its row is counters only. */
+        LOG_QUIET(" bytes      iterations  QPS_actual   BW_avg[%s/s] MsgRate[Mpps]\n", unit->name);
+    }
 
     while (!*cc->stop && !g_exit_flag) {
-        int pr = comm_poll(cc->cfg, 0, 100);
+        int pr = comm_poll(cc->cfg, 0, poll_slice_ms);
         if (pr < 0) {
             if (errno == EINTR) {
                 continue;
@@ -225,6 +247,27 @@ static void *seq_infinite_server_ctrl(void *arg)
                 break;
             }
         }
+        if (cc->recv_count == NULL) {
+            continue;
+        }
+        elapsed_ms += (uint32_t)poll_slice_ms;
+        if (elapsed_ms < period_ms) {
+            continue;
+        }
+        elapsed_ms = 0;
+        uint64_t now_count = __atomic_load_n(cc->recv_count, __ATOMIC_RELAXED);
+        uint64_t now_cycles = get_cycles();
+        double interval_s = (double)(now_cycles - last_cycles) / cycles_to_sec;
+        uint64_t packets = now_count - last_count;
+        if (interval_s > 0.0 && packets > 0) {
+            double bw_avg = ((double)cc->avg_size * (double)packets) / (interval_s * unit_ratio);
+            double actual_qps = (double)packets / interval_s;
+            double msg_rate = actual_qps / (double)PERFTEST_M;
+            LOG_QUIET(" %-11u %-11lu %-13lu %-13.2f %-13.6f\n",
+                      cc->avg_size, packets, (uint64_t)actual_qps, bw_avg, msg_rate);
+        }
+        last_count = now_count;
+        last_cycles = now_cycles;
     }
     return NULL;
 }
@@ -272,7 +315,14 @@ static void *sequential_worker(void *arg)
             if (run_ctx->state == END_STATE) {
                 break;
             }
-            if (run_ctx->state == START_STATE) {
+            if (cfg->time_type.bs.infinite == 1) {
+                /* -y -D: collect throughout WARMUP/START/STOP like upstream's
+                 * cumulative iters counter; the state machine only controls
+                 * exit timing, not collection. Periodic lines carry data from
+                 * the very start (matching upstream, hence the "first and
+                 * last results may be invalid" startup warning). */
+                collecting = true;
+            } else if (run_ctx->state == START_STATE) {
                 if (!collecting) {
                     collecting = true;
                     hist_reset(&t->hist);
@@ -490,6 +540,9 @@ static void *recv_server_worker(void *arg)
                 return NULL;
             }
             rcnt++;
+            if (cfg->time_type.bs.infinite == 1) {
+                __atomic_add_fetch(&run_ctx->inf_recv_count, 1, __ATOMIC_RELAXED);
+            }
 
             if (cfg->time_type.bs.duration == 1) {
                 if (run_ctx->state == START_STATE) {
@@ -819,7 +872,7 @@ static int run_sequential_client(perftest_context_t *ctx, perftest_config_t *cfg
     }
 
     uint32_t avg_size = get_actual_avg_size(ctx, cfg);
-    /* -y: no final report, matching the pipeline infinite convention — the
+    /* -y: no final report, matching the pipeline infinite convention -- the
      * last periodic line is the client's final output; the server still
      * prints its row from the report exchange below. */
     if (cfg->time_type.bs.infinite == 0) {
@@ -1086,9 +1139,14 @@ static int run_recv_server_mt(perftest_context_t *ctx, perftest_config_t *cfg, b
     bool ctrl_on = false;
     if (cfg->time_type.bs.infinite == 1) {
         g_exit_flag = 0;
+        ctx->run_ctx.inf_recv_count = 0;
         (void)signal(SIGINT, seq_catch_sigint);
         cc.cfg = cfg;
         cc.stop = &ctrl_stop;
+        cc.recv_count = &ctx->run_ctx.inf_recv_count;
+        cc.period_ms = (cfg->inf_period_ms > 0) ? cfg->inf_period_ms : (uint32_t)cfg->inf_period * 1000;
+        cc.cpu_mhz = cpu_mhz;
+        cc.avg_size = get_actual_avg_size(ctx, cfg);
         if (pthread_create(&ctrl_tid, NULL, seq_infinite_server_ctrl, &cc) != 0) {
             LOG_ERROR("Failed to create infinite control thread.\n");
             (void)signal(SIGINT, SIG_DFL);
@@ -1197,7 +1255,10 @@ static int run_recv_server_mt(perftest_context_t *ctx, perftest_config_t *cfg, b
         remote.global_start = global_start;
         remote.global_end = global_end;
         remote.bw_only = true;
-        print_sequential_report_from_data(&remote, cfg, print_header);
+        /* -y: periodic rows only (client-side convention); no final row. */
+        if (cfg->time_type.bs.infinite == 0) {
+            print_sequential_report_from_data(&remote, cfg, print_header);
+        }
     }
 
     free(args);
@@ -1302,7 +1363,11 @@ int bench_run_sequential(perftest_context_t *ctx, perftest_config_t *cfg)
                               (char *)&local, (char *)&remote) != 0) {
                     return -1;
                 }
-                print_sequential_report_from_data(&remote, cfg, (s == 0 && !cfg->sweep));
+                /* -y: periodic rows only (client-side convention); the
+                 * exchange still runs for protocol completion. */
+                if (cfg->time_type.bs.infinite == 0) {
+                    print_sequential_report_from_data(&remote, cfg, (s == 0 && !cfg->sweep));
+                }
             }
         }
         return 0;
@@ -1333,7 +1398,7 @@ int bench_run_sequential(perftest_context_t *ctx, perftest_config_t *cfg)
 
     uint32_t sizes = cfg->all ? cfg->order : 1;
     if (cfg->all) {
-        /* One header, one row per size — same convention as the pipeline -a scan. */
+        /* One header, one row per size -- same convention as the pipeline -a scan. */
         print_sequential_header(cfg);
     }
     for (uint32_t s = 0; s < sizes; s++) {
