@@ -8,6 +8,7 @@
  */
 
 #include <errno.h>
+#include <dlfcn.h>
 #include <malloc.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -163,6 +164,21 @@ static int init_device(perftest_context_t *ctx, perftest_config_t *cfg)
         .token = 0,
         .uasid = 0,
     };
+
+    /* liburma loads the provider by scanning <liburma_dir>/urma/ (urma_open_drivers).
+     * On environments where that subdirectory is missing (e.g. K8s containers
+     * with manually placed files), the scan silently skips and the device list
+     * stays empty. dlopen the provider from the standard library path before
+     * urma_init as a fallback; if not found there either, liburma's own scan
+     * handles it (standard RPM installations have /usr/lib64/urma/). */
+    void *provider = dlopen("liburma-udma.so", RTLD_LAZY | RTLD_GLOBAL);
+    if (provider == NULL) {
+        LOG_INFO("liburma-udma.so not found, using built-in provider.\n");
+    }
+    void *ubagg = dlopen("liburma_ubagg.so", RTLD_LAZY | RTLD_GLOBAL);
+    if (ubagg == NULL) {
+        LOG_INFO("liburma_ubagg.so not found, aggregation features may be unavailable.\n");
+    }
 
     if (verbose_get_level() >= VLOG_LEVEL_VVERBOSE) {
         status = urma_register_log_func(print_log);

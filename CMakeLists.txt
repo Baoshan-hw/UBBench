@@ -94,6 +94,7 @@ target_link_libraries(ub_bench
         ${URMA_COMMON_LIB}
         pthread
         m
+        ${CMAKE_DL_LIBS}
 )
 
 install(TARGETS ub_bench
